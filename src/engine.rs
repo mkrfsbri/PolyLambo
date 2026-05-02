@@ -270,19 +270,24 @@ pub async fn run_engine_loop(
                 let _ = clob.cancel_all().await;
                 break;
             }
-            // Edge = how far the relevant outcome token is below fair value (0.5).
-            // When BTC is bullish and Up token is trading at e.g. 0.45, edge = 0.05.
-            // If the market has already repriced to >= 0.5, edge = 0 and we skip.
+            // Edge = spread component + lead-lag floor.
+            // Lead-lag floor (0.02): BTC moves ~50-200ms before Polymarket reprices,
+            // giving baseline alpha even when the token is near fair value.
+            // Spread component: how far below 0.5 the token is (extra mispricing).
+            // If the market has already repriced above 0.65 we consider our signal stale.
             let token_price = match direction {
                 Direction::Up =>
                     atomic_to_f64(eng.state.eth_up_price.load(Ordering::Acquire)),
                 Direction::Down =>
                     atomic_to_f64(eng.state.eth_down_price.load(Ordering::Acquire)),
             };
-            let edge = if token_price > 0.0 && token_price < 0.5 {
-                0.5 - token_price
+            const LEAD_LAG_FLOOR: f64 = 0.02;
+            const STALE_THRESHOLD: f64 = 0.65;
+            let edge = if token_price > 0.0 && token_price < STALE_THRESHOLD {
+                let spread = if token_price < 0.5 { 0.5 - token_price } else { 0.0 };
+                spread + LEAD_LAG_FLOOR
             } else {
-                0.0 // market already repriced — no edge
+                0.0 // market fully repriced or no price available — skip
             };
             tracing::debug!("[ENGINE] token_price={token_price:.4} edge={edge:.4}");
             let sz = eng.half_kelly_size(edge, balance);
