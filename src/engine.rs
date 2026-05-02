@@ -210,13 +210,14 @@ pub async fn run_engine_loop(
             continue; // BTC feed not yet connected
         }
 
-        // ── reversal check ─────────────────────────────────────────────────
+        // ── reversal check + state broadcast ──────────────────────────────
         let reversal = { engine.lock().await.check_reversal(btc_price) };
 
-        match reversal {
+        match &reversal {
             ReversalStatus::EmergencyFlip if expiry > EXPIRY_GUARD_SECS => {
                 let state = engine.lock().await.state.clone();
                 state.bot_status.store(bot_status::EMERGENCY, Ordering::Release);
+                state.reversal_deviation.store(0, Ordering::Release);
                 let _ = clob.cancel_all().await;
                 tracing::warn!("[ENGINE] EMERGENCY FLIP — all orders cancelled");
                 let mut eng = engine.lock().await;
@@ -225,11 +226,16 @@ pub async fn run_engine_loop(
             }
             ReversalStatus::Warning(pct) => {
                 tracing::warn!("[ENGINE] Reversal WARNING {pct:.4}% — tightening stop");
-                engine.lock().await.state.bot_status
-                    .store(bot_status::REVERSAL, Ordering::Release);
+                let state = engine.lock().await.state.clone();
+                state.bot_status.store(bot_status::REVERSAL, Ordering::Release);
+                state.reversal_deviation.store(
+                    crate::state::f64_to_atomic(*pct),
+                    Ordering::Release,
+                );
             }
             _ => {
                 let state = engine.lock().await.state.clone();
+                state.reversal_deviation.store(0, Ordering::Release);
                 if state.bot_status.load(Ordering::Acquire) == bot_status::REVERSAL {
                     state.bot_status.store(bot_status::HUNTING, Ordering::Release);
                 }
@@ -251,14 +257,22 @@ pub async fn run_engine_loop(
             }
         };
 
-        // ── size ───────────────────────────────────────────────────────────
-        let (size, dry_run) = {
+        // ── size + token id ────────────────────────────────────────────────
+        let (size, dry_run, ttl_secs, state_arc) = {
             let eng = engine.lock().await;
             let balance = atomic_to_f64(
                 eng.state.balance_usdc.load(Ordering::Acquire) as u64
             );
-            let edge = 0.05_f64; // Phase 5: derive from orderbook spread
-            (eng.half_kelly_size(edge, balance), eng.config.dry_run)
+            // Halt if balance fell below $1
+            if balance < 1.0 {
+                tracing::error!("[ENGINE] Balance ${balance:.2} < $1 — EMERGENCY halt");
+                eng.state.bot_status.store(bot_status::EMERGENCY, Ordering::Release);
+                let _ = clob.cancel_all().await;
+                break;
+            }
+            let edge = 0.05_f64; // derive from spread in Phase 9+ refinement
+            let sz   = eng.half_kelly_size(edge, balance);
+            (sz, eng.config.dry_run, eng.config.order_ttl_secs, eng.state.clone())
         };
 
         if size < 1.0 {
@@ -270,26 +284,67 @@ pub async fn run_engine_loop(
                 "[ENGINE] DRY_RUN signal={:?} size=${size:.2} expiry={expiry}s",
                 direction
             );
+            // Update momentum_decaying for TUI even in dry_run
+            let decaying = {
+                let mut eng = engine.lock().await;
+                eng.momentum.is_decaying()
+            };
+            state_arc.momentum_decaying.store(decaying as u8, Ordering::Release);
             continue;
         }
 
-        // ── place order + spawn watchdog ───────────────────────────────────
-        // (Phase 5: real CLOB call via clob.place_limit_order)
-        let ttl_secs       = engine.lock().await.config.order_ttl_secs;
-        let initial_trend  = engine.lock().await.state.btc.trend.load(Ordering::Acquire);
-        let state_for_watch = engine.lock().await.state.clone();
-        let clob_w         = clob.clone();
+        // ── resolve token + price ──────────────────────────────────────────
+        let (token_id, price) = {
+            match direction {
+                Direction::Up => (
+                    state_arc.up_token_id.read().await.clone(),
+                    atomic_to_f64(state_arc.eth_up_price.load(Ordering::Acquire)),
+                ),
+                Direction::Down => (
+                    state_arc.down_token_id.read().await.clone(),
+                    atomic_to_f64(state_arc.eth_down_price.load(Ordering::Acquire)),
+                ),
+            }
+        };
 
-        // placeholder order_id until Phase 5 wires the real CLOB call
-        let order_id = format!("pending-{ts_ms}");
+        if token_id.is_empty() || price == 0.0 {
+            tracing::debug!("[ENGINE] Skipping — market not yet discovered");
+            continue;
+        }
+
+        // ── place order ────────────────────────────────────────────────────
+        let t_signal = Instant::now();
+        let order_side = OrderSide::from(direction.clone());
+        let order_id = match clob.place_limit_order(&token_id, &order_side, price, size).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!("[ENGINE] Order placement failed: {e:#}");
+                continue;
+            }
+        };
+        let lat_us = t_signal.elapsed().as_micros();
+        state_arc.api_latency_ms.store((lat_us / 1000) as u64, Ordering::Release);
+        if lat_us > 500 {
+            tracing::warn!("[ENGINE] signal→order {}μs exceeds 500μs target", lat_us);
+        }
+
+        state_arc.bot_status.store(bot_status::POSITION, Ordering::Release);
         tracing::info!(
-            "[ENGINE] Signal {:?} ${size:.2} — order {order_id} (CLOB in Phase 5)",
-            direction
+            "[ENGINE] POSITION {:?} | ${size:.2} | price={price:.4} | ttl={ttl_secs}s | lat={}μs",
+            direction, lat_us
         );
 
+        // ── watchdog ───────────────────────────────────────────────────────
+        let initial_trend   = state_arc.btc.trend.load(Ordering::Acquire);
+        let state_for_watch = state_arc.clone();
+        let clob_w          = clob.clone();
         tokio::spawn(async move {
             order_watchdog(order_id, ttl_secs, initial_trend, state_for_watch, clob_w).await;
         });
+
+        // Update momentum_decaying for TUI
+        let decaying = { engine.lock().await.momentum.is_decaying() };
+        state_arc.momentum_decaying.store(decaying as u8, Ordering::Release);
     }
 }
 

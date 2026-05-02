@@ -8,13 +8,15 @@ use alloy::sol_types::{Eip712Domain, SolStruct};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const SIGNAL_BUDGET_US: u128 = 500; // signal→order_submit target < 500 μs
 
 use crate::state::OrderSide;
 
@@ -136,6 +138,48 @@ impl ClobClient {
         Ok(format!("0x{}", hex::encode(sig.as_bytes())))
     }
 
+    // ── HTTP with retry ───────────────────────────────────────────────────────
+
+    /// Send a single authenticated request, retrying once on 429 and bailing
+    /// on 401. Returns the raw `Response` on success.
+    async fn http_call(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<Response> {
+        for attempt in 0..=1u8 {
+            let headers = self.hmac_auth_headers(method, path, body)?;
+            let url = format!("{CLOB_BASE}{path}");
+            let req = match method {
+                "POST" => self
+                    .client
+                    .post(&url)
+                    .headers(headers)
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string()),
+                "DELETE" => self.client.delete(&url).headers(headers),
+                "GET" => self.client.get(&url).headers(headers),
+                other => anyhow::bail!("unsupported HTTP method: {other}"),
+            };
+
+            let resp = req.send().await.context("clob http send")?;
+            match resp.status().as_u16() {
+                429 if attempt == 0 => {
+                    tracing::warn!("[CLOB] 429 rate-limited on {method} {path} — retry in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                401 => {
+                    tracing::error!("[CLOB] 401 Unauthorized on {method} {path} — halting");
+                    anyhow::bail!("CLOB 401 Unauthorized")
+                }
+                _ => return Ok(resp),
+            }
+        }
+        anyhow::bail!("CLOB {method} {path} failed after retry")
+    }
+
     // ── public API ────────────────────────────────────────────────────────────
 
     /// Place a limit order. `side` is the OUTCOME direction (Up = buy the Up
@@ -199,17 +243,9 @@ impl ClobClient {
         })
         .to_string();
 
-        let headers = self.hmac_auth_headers("POST", "/order", &body)?;
-
         let resp: serde_json::Value = self
-            .client
-            .post(format!("{CLOB_BASE}/order"))
-            .headers(headers)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .context("clob place_order send")?
+            .http_call("POST", "/order", &body)
+            .await?
             .json()
             .await
             .context("clob place_order parse")?;
@@ -221,35 +257,32 @@ impl ClobClient {
             .unwrap_or("unknown")
             .to_string();
 
-        let lat_ms = t0.elapsed().as_millis();
+        let lat_ms  = t0.elapsed().as_millis();
+        let lat_us  = t0.elapsed().as_micros();
         let side_str = match side { OrderSide::Up => "UP", OrderSide::Down => "DOWN" };
         tracing::info!(
             "[CLOB] Order placed | ID: {order_id} | Side: {side_str} | Price: {price:.2} | Size: ${size_usdc:.0} | Lat: {lat_ms}ms"
         );
+        if lat_us > SIGNAL_BUDGET_US {
+            tracing::warn!(
+                "[CLOB] signal→order_submit {}μs exceeded {}μs budget",
+                lat_us, SIGNAL_BUDGET_US
+            );
+        }
 
         Ok(order_id)
     }
 
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
         let path = format!("/orders/{order_id}");
-        let headers = self.hmac_auth_headers("DELETE", &path, "")?;
-        self.client
-            .delete(format!("{CLOB_BASE}{path}"))
-            .headers(headers)
-            .send()
-            .await
-            .context("clob cancel_order")?;
+        self.http_call("DELETE", &path, "").await?;
+        tracing::debug!("[CLOB] Cancelled order {order_id}");
         Ok(())
     }
 
     pub async fn cancel_all(&self) -> Result<()> {
-        let headers = self.hmac_auth_headers("DELETE", "/orders", "")?;
-        self.client
-            .delete(format!("{CLOB_BASE}/orders"))
-            .headers(headers)
-            .send()
-            .await
-            .context("clob cancel_all")?;
+        self.http_call("DELETE", "/orders", "").await?;
+        tracing::info!("[CLOB] All orders cancelled");
         Ok(())
     }
 
@@ -264,6 +297,7 @@ impl ClobClient {
             bids: Vec<Level>,
         }
 
+        // Order book is public — no auth headers needed, but we still want retry.
         let book: Book = self
             .client
             .get(format!("{CLOB_BASE}/book"))
@@ -325,16 +359,7 @@ impl ClobClient {
         })
         .to_string();
 
-        let headers = self.hmac_auth_headers("POST", "/order", &body)?;
-        self.client
-            .post(format!("{CLOB_BASE}/order"))
-            .headers(headers)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .context("clob sell_best_bid")?;
-
+        self.http_call("POST", "/order", &body).await?;
         tracing::info!(
             "[CLOB] Sell at best bid | token: {token_id} | qty: {qty:.2} | bid: {best_bid:.4}"
         );
@@ -346,14 +371,9 @@ impl ClobClient {
         struct Resp {
             balance: String,
         }
-        let headers = self.hmac_auth_headers("GET", "/balance", "")?;
         let resp: Resp = self
-            .client
-            .get(format!("{CLOB_BASE}/balance"))
-            .headers(headers)
-            .send()
-            .await
-            .context("clob get_balance")?
+            .http_call("GET", "/balance", "")
+            .await?
             .json()
             .await
             .context("clob balance parse")?;
