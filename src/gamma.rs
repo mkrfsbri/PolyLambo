@@ -49,6 +49,9 @@ struct GammaMarket {
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: Vec<String>,
     question: String,
+    /// ["0.505", "0.495"] — index 0=Up, index 1=Down
+    #[serde(rename = "outcomePrices", default)]
+    outcome_prices: Vec<String>,
     #[allow(dead_code)]
     #[serde(rename = "endDate")]
     end_date: String,
@@ -56,14 +59,20 @@ struct GammaMarket {
 
 // ── HTTP fetch ────────────────────────────────────────────────────────────────
 
-/// Fetch (up_token_id, down_token_id) for the given slug.
+pub struct MarketTokens {
+    pub up_token_id: String,
+    pub down_token_id: String,
+    /// Current Up outcome price (0.0–1.0). None if not available.
+    pub up_price: Option<f64>,
+    /// Current Down outcome price (0.0–1.0). None if not available.
+    pub down_price: Option<f64>,
+}
+
+/// Fetch token IDs (and current prices) for the given slug.
 ///
-/// Finds the market whose question contains "Up" — that market's token 0 is
-/// the Up outcome and token 1 is the Down outcome.
-pub async fn fetch_market_tokens(
-    slug: &str,
-    client: &Client,
-) -> Result<(String, String)> {
+/// The event has one market: "Ethereum Up or Down - ...". Its `clobTokenIds[0]`
+/// is the Up outcome token, `clobTokenIds[1]` is the Down outcome token.
+pub async fn fetch_market_tokens(slug: &str, client: &Client) -> Result<MarketTokens> {
     let url = format!("{GAMMA_BASE}/events?slug={slug}");
     let events: Vec<GammaEvent> = client
         .get(&url)
@@ -78,20 +87,26 @@ pub async fn fetch_market_tokens(
         bail!("gamma: slug not found: {slug}");
     }
 
+    // Single market per event — question always contains "Up or Down"
     let market = events[0]
         .markets
         .iter()
         .find(|m| m.question.contains("Up"))
-        .context("gamma: no 'Up' market in event")?;
+        .context("gamma: no market with 'Up' in question")?;
 
     if market.clob_token_ids.len() < 2 {
         bail!("gamma: expected 2 token ids, got {}", market.clob_token_ids.len());
     }
 
-    Ok((
-        market.clob_token_ids[0].clone(),
-        market.clob_token_ids[1].clone(),
-    ))
+    let up_price = market.outcome_prices.first().and_then(|s| s.parse().ok());
+    let down_price = market.outcome_prices.get(1).and_then(|s| s.parse().ok());
+
+    Ok(MarketTokens {
+        up_token_id: market.clob_token_ids[0].clone(),
+        down_token_id: market.clob_token_ids[1].clone(),
+        up_price,
+        down_price,
+    })
 }
 
 // ── discovery loop ────────────────────────────────────────────────────────────
@@ -106,13 +121,27 @@ pub async fn discover_and_update(state: Arc<AppState>, client: Client) {
         let current = state.current_slug.read().await.clone();
         if slug != current {
             match fetch_market_tokens(&slug, &client).await {
-                Ok((up, down)) => {
+                Ok(tokens) => {
                     tracing::info!(
-                        "[GAMMA] Slug: {slug} | UP: {up} | DOWN: {down}"
+                        "[GAMMA] Slug: {slug} | UP: {} | DOWN: {}",
+                        tokens.up_token_id,
+                        tokens.down_token_id,
                     );
                     *state.current_slug.write().await = slug;
-                    *state.up_token_id.write().await = up;
-                    *state.down_token_id.write().await = down;
+                    *state.up_token_id.write().await = tokens.up_token_id;
+                    *state.down_token_id.write().await = tokens.down_token_id;
+                    if let Some(p) = tokens.up_price {
+                        state.eth_up_price.store(
+                            crate::state::f64_to_atomic(p),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
+                    if let Some(p) = tokens.down_price {
+                        state.eth_down_price.store(
+                            crate::state::f64_to_atomic(p),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("[GAMMA] Slug {slug} not yet available: {e:#}");
@@ -197,13 +226,16 @@ mod tests {
 
     #[test]
     fn test_parse_gamma_event_json() {
+        // Matches real Gamma API response structure observed 2026-05-02
         let json = r#"[{
-            "slug": "eth-updown-5m-1746000300",
+            "slug": "eth-updown-5m-1777727100",
             "markets": [
                 {
-                    "question": "Will ETH go Up in the next 5 minutes?",
-                    "clobTokenIds": ["0xUP_TOKEN", "0xDOWN_TOKEN"],
-                    "endDate": "2025-04-30T00:05:00Z"
+                    "question": "Ethereum Up or Down - May 2, 9:05AM-9:10AM ET",
+                    "clobTokenIds": ["94554453955679131155753198461295833893575139847238407557374141327659939814789",
+                                     "66111132003643556944495002313248397782437884834651728460739474369989675475918"],
+                    "outcomePrices": ["0.505", "0.495"],
+                    "endDate": "2026-05-02T13:10:00Z"
                 }
             ]
         }]"#;
@@ -211,8 +243,11 @@ mod tests {
         let events: Vec<GammaEvent> = serde_json::from_str(json).unwrap();
         assert_eq!(events.len(), 1);
         let market = events[0].markets.iter().find(|m| m.question.contains("Up")).unwrap();
-        assert_eq!(market.clob_token_ids[0], "0xUP_TOKEN");
-        assert_eq!(market.clob_token_ids[1], "0xDOWN_TOKEN");
+        assert_eq!(market.clob_token_ids.len(), 2);
+        let up_price: f64 = market.outcome_prices[0].parse().unwrap();
+        let down_price: f64 = market.outcome_prices[1].parse().unwrap();
+        assert!((up_price - 0.505).abs() < 1e-6);
+        assert!((down_price - 0.495).abs() < 1e-6);
     }
 
     #[test]
