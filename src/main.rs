@@ -118,6 +118,38 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Balance monitor — check every 30s, halt if < $1
+    if !cfg.dry_run {
+        let clob_bm  = clob.clone();
+        let state_bm = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                match clob_bm.get_balance().await {
+                    Ok(bal) => {
+                        state_bm.balance_usdc.store(
+                            state::f64_to_atomic(bal) as i64,
+                            Ordering::Release,
+                        );
+                        if bal < 1.0 {
+                            tracing::error!(
+                                "[BALANCE] Balance ${bal:.2} < $1 — EMERGENCY halt"
+                            );
+                            state_bm.bot_status.store(
+                                state::bot_status::EMERGENCY,
+                                Ordering::Release,
+                            );
+                        } else {
+                            tracing::debug!("[BALANCE] ${bal:.2}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("[BALANCE] refresh failed: {e:#}"),
+                }
+            }
+        });
+    }
+
     // ── graceful shutdown ─────────────────────────────────────────────────────
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -165,7 +197,12 @@ async fn build_snapshot(state: &state::AppState) -> tui::TuiSnapshot {
                 ttl_secs: u64::MAX,
             }
         }).collect(),
-        reversal_warning: None,   // populated by engine in Phase 9 hardening
-        momentum_decaying: false, // populated by engine in Phase 9 hardening
+        reversal_warning: {
+            let dev = state::atomic_to_f64(
+                state.reversal_deviation.load(Ordering::Acquire)
+            );
+            if dev > 0.0 { Some(dev) } else { None }
+        },
+        momentum_decaying: state.momentum_decaying.load(Ordering::Acquire) != 0,
     }
 }

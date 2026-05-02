@@ -3,10 +3,12 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_retry::Retry;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+const LATENCY_BUDGET_US: u128 = 100; // ws_receive→price_update target < 100 μs
 
 use crate::state::{AppState, atomic_to_f64, f64_to_atomic, trend};
 
@@ -58,11 +60,20 @@ async fn connect_and_stream(state: Arc<AppState>, attempt: u32) -> Result<()> {
     while let Some(msg) = ws.next().await {
         match msg.context("binance ws read")? {
             Message::Text(text) => {
+                let t_recv = Instant::now();
                 let trade: AggTrade = match serde_json::from_str(&text) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
                 update_feed(&state, &trade);
+                let lat_us = t_recv.elapsed().as_micros();
+                tracing::trace!("[BINANCE] ws_recv→store {}μs", lat_us);
+                if lat_us > LATENCY_BUDGET_US {
+                    tracing::warn!(
+                        "[BINANCE] ws_recv→store {}μs exceeded {}μs budget",
+                        lat_us, LATENCY_BUDGET_US
+                    );
+                }
             }
             Message::Close(_) => {
                 tracing::warn!("[BINANCE] Server closed connection");
