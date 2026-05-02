@@ -1,1 +1,234 @@
-// Phase 3 placeholder
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use reqwest::Client;
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::state::AppState;
+
+const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
+const POLL_INTERVAL_SECS: u64 = 10;
+const WINDOW_SECS: u64 = 300;
+
+// ── slug algorithm ────────────────────────────────────────────────────────────
+
+/// Compute the next 5-minute window slug.
+///
+/// Always rounds to the STRICTLY NEXT multiple of 300s — even when `now` is
+/// exactly on a boundary (market has just expired → predict the next one).
+pub fn compute_next_slug() -> String {
+    let ts = Utc::now().timestamp() as u64;
+    slug_for_ts(ts)
+}
+
+/// Pure function — compute slug for an arbitrary unix timestamp.
+/// Separated for deterministic unit-testing.
+pub fn slug_for_ts(ts: u64) -> String {
+    let next = ((ts / WINDOW_SECS) + 1) * WINDOW_SECS;
+    format!("eth-updown-5m-{next}")
+}
+
+/// Seconds remaining until the next 300s boundary from an arbitrary timestamp.
+pub fn expiry_secs_for_ts(ts: u64) -> u64 {
+    let next = ((ts / WINDOW_SECS) + 1) * WINDOW_SECS;
+    next - ts
+}
+
+// ── API types ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct GammaEvent {
+    #[allow(dead_code)]
+    slug: String,
+    markets: Vec<GammaMarket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaMarket {
+    #[serde(rename = "clobTokenIds")]
+    clob_token_ids: Vec<String>,
+    question: String,
+    #[allow(dead_code)]
+    #[serde(rename = "endDate")]
+    end_date: String,
+}
+
+// ── HTTP fetch ────────────────────────────────────────────────────────────────
+
+/// Fetch (up_token_id, down_token_id) for the given slug.
+///
+/// Finds the market whose question contains "Up" — that market's token 0 is
+/// the Up outcome and token 1 is the Down outcome.
+pub async fn fetch_market_tokens(
+    slug: &str,
+    client: &Client,
+) -> Result<(String, String)> {
+    let url = format!("{GAMMA_BASE}/events?slug={slug}");
+    let events: Vec<GammaEvent> = client
+        .get(&url)
+        .send()
+        .await
+        .context("gamma fetch events")?
+        .json()
+        .await
+        .context("gamma parse events")?;
+
+    if events.is_empty() {
+        bail!("gamma: slug not found: {slug}");
+    }
+
+    let market = events[0]
+        .markets
+        .iter()
+        .find(|m| m.question.contains("Up"))
+        .context("gamma: no 'Up' market in event")?;
+
+    if market.clob_token_ids.len() < 2 {
+        bail!("gamma: expected 2 token ids, got {}", market.clob_token_ids.len());
+    }
+
+    Ok((
+        market.clob_token_ids[0].clone(),
+        market.clob_token_ids[1].clone(),
+    ))
+}
+
+// ── discovery loop ────────────────────────────────────────────────────────────
+
+/// Long-running task: polls every 10s, updates AppState when the slug changes.
+pub async fn discover_and_update(state: Arc<AppState>, client: Client) {
+    loop {
+        let slug = compute_next_slug();
+        let ts = Utc::now().timestamp() as u64;
+
+        // Only re-fetch when the slug has changed
+        let current = state.current_slug.read().await.clone();
+        if slug != current {
+            match fetch_market_tokens(&slug, &client).await {
+                Ok((up, down)) => {
+                    tracing::info!(
+                        "[GAMMA] Slug: {slug} | UP: {up} | DOWN: {down}"
+                    );
+                    *state.current_slug.write().await = slug;
+                    *state.up_token_id.write().await = up;
+                    *state.down_token_id.write().await = down;
+                }
+                Err(e) => {
+                    tracing::warn!("[GAMMA] Slug {slug} not yet available: {e:#}");
+                }
+            }
+        }
+
+        // Always refresh expiry countdown
+        let expiry = expiry_secs_for_ts(ts);
+        state
+            .time_to_expiry_secs
+            .store(expiry, std::sync::atomic::Ordering::Release);
+
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+    }
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── slug generation ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_slug_generation_mid_window() {
+        // 1746000150 is 150s into a window (1746000000..1746000300)
+        let slug = slug_for_ts(1_746_000_150);
+        assert_eq!(slug, "eth-updown-5m-1746000300");
+    }
+
+    #[test]
+    fn test_slug_generation_near_boundary() {
+        // 1746000299 is 1s before boundary
+        let slug = slug_for_ts(1_746_000_299);
+        assert_eq!(slug, "eth-updown-5m-1746000300");
+    }
+
+    #[test]
+    fn test_slug_boundary_edge() {
+        // Exactly on a 300s boundary → must predict the NEXT window, not current
+        let slug = slug_for_ts(1_746_000_000);
+        assert_eq!(slug, "eth-updown-5m-1746000300");
+    }
+
+    #[test]
+    fn test_slug_boundary_plus_one() {
+        // 1 second past a boundary → next boundary is 299s away
+        let slug = slug_for_ts(1_746_000_301);
+        assert_eq!(slug, "eth-updown-5m-1746000600");
+    }
+
+    #[test]
+    fn test_slug_format() {
+        let slug = slug_for_ts(1_000_000_000);
+        assert!(slug.starts_with("eth-updown-5m-"));
+        let suffix: u64 = slug.trim_start_matches("eth-updown-5m-").parse().unwrap();
+        assert_eq!(suffix % 300, 0, "slug timestamp must be multiple of 300");
+    }
+
+    // ── expiry countdown ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expiry_mid_window() {
+        // 150s into window → 150s remaining
+        assert_eq!(expiry_secs_for_ts(1_746_000_150), 150);
+    }
+
+    #[test]
+    fn test_expiry_on_boundary() {
+        // Exactly on boundary → full 300s to next
+        assert_eq!(expiry_secs_for_ts(1_746_000_000), 300);
+    }
+
+    #[test]
+    fn test_expiry_one_before_boundary() {
+        assert_eq!(expiry_secs_for_ts(1_746_000_299), 1);
+    }
+
+    // ── token parsing (unit, no HTTP) ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_gamma_event_json() {
+        let json = r#"[{
+            "slug": "eth-updown-5m-1746000300",
+            "markets": [
+                {
+                    "question": "Will ETH go Up in the next 5 minutes?",
+                    "clobTokenIds": ["0xUP_TOKEN", "0xDOWN_TOKEN"],
+                    "endDate": "2025-04-30T00:05:00Z"
+                }
+            ]
+        }]"#;
+
+        let events: Vec<GammaEvent> = serde_json::from_str(json).unwrap();
+        assert_eq!(events.len(), 1);
+        let market = events[0].markets.iter().find(|m| m.question.contains("Up")).unwrap();
+        assert_eq!(market.clob_token_ids[0], "0xUP_TOKEN");
+        assert_eq!(market.clob_token_ids[1], "0xDOWN_TOKEN");
+    }
+
+    #[test]
+    fn test_parse_gamma_event_missing_up_market() {
+        let json = r#"[{
+            "slug": "eth-updown-5m-1746000300",
+            "markets": [
+                {
+                    "question": "Some other market",
+                    "clobTokenIds": ["0xA", "0xB"],
+                    "endDate": "2025-04-30T00:05:00Z"
+                }
+            ]
+        }]"#;
+        let events: Vec<GammaEvent> = serde_json::from_str(json).unwrap();
+        let up_market = events[0].markets.iter().find(|m| m.question.contains("Up"));
+        assert!(up_market.is_none());
+    }
+}
