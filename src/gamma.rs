@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,13 +44,38 @@ struct GammaEvent {
     markets: Vec<GammaMarket>,
 }
 
+/// The Gamma API returns outcomePrices either as a native JSON array
+/// `["0.505","0.495"]` or as a JSON-encoded string `"[\"0.505\",\"0.495\"]"`.
+/// This deserializer handles both forms.
+/// Deserialize a JSON field that may be either a native array `["a","b"]`
+/// or a JSON-encoded string `"[\"a\",\"b\"]"` — both forms appear in Gamma API responses.
+fn deserialize_string_array<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_json::Value::deserialize(de)?;
+    match v {
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .map(|x| match x {
+                serde_json::Value::String(s) => Ok(s),
+                other => Ok(other.to_string()),
+            })
+            .collect(),
+        serde_json::Value::String(s) => serde_json::from_str::<Vec<String>>(&s)
+            .map_err(|e| D::Error::custom(format!("string array parse: {e}"))),
+        _ => Ok(vec![]),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GammaMarket {
-    #[serde(rename = "clobTokenIds")]
+    #[serde(rename = "clobTokenIds", deserialize_with = "deserialize_string_array")]
     clob_token_ids: Vec<String>,
     question: String,
-    /// ["0.505", "0.495"] — index 0=Up, index 1=Down
-    #[serde(rename = "outcomePrices", default)]
+    /// Up price at index 0, Down price at index 1 (0.0–1.0)
+    #[serde(rename = "outcomePrices", default, deserialize_with = "deserialize_string_array")]
     outcome_prices: Vec<String>,
     #[allow(dead_code)]
     #[serde(rename = "endDate")]
@@ -248,6 +273,30 @@ mod tests {
         let down_price: f64 = market.outcome_prices[1].parse().unwrap();
         assert!((up_price - 0.505).abs() < 1e-6);
         assert!((down_price - 0.495).abs() < 1e-6);
+    }
+
+    /// The live Gamma API sometimes returns clobTokenIds and outcomePrices as
+    /// JSON-encoded strings rather than native arrays. Both forms must parse.
+    #[test]
+    fn test_parse_gamma_event_string_encoded_fields() {
+        let json = r#"[{
+            "slug": "eth-updown-5m-1777738500",
+            "markets": [
+                {
+                    "question": "Ethereum Up or Down - May 3",
+                    "clobTokenIds": "[\"66509974476329633817894519361708972512933473416410477343917590711622208409549\", \"98831085497971659267355113836123523466884781766668270733188350551666247502647\"]",
+                    "outcomePrices": "[\"0.505\", \"0.495\"]",
+                    "endDate": "2026-05-03T13:10:00Z"
+                }
+            ]
+        }]"#;
+
+        let events: Vec<GammaEvent> = serde_json::from_str(json).unwrap();
+        let market = events[0].markets.iter().find(|m| m.question.contains("Up")).unwrap();
+        assert_eq!(market.clob_token_ids.len(), 2);
+        assert!(market.clob_token_ids[0].starts_with("665"));
+        let up_price: f64 = market.outcome_prices[0].parse().unwrap();
+        assert!((up_price - 0.505).abs() < 1e-6);
     }
 
     #[test]
