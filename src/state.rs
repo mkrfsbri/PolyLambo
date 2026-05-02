@@ -120,6 +120,8 @@ pub struct AppState {
 
     /// last measured CLOB API round-trip ms
     pub api_latency_ms: AtomicU64,
+    /// last measured Binance ws_recv→price_update μs
+    pub ws_latency_us: AtomicU64,
 
     /// reversal deviation * 1_000_000 (0 = Normal, >0 = Warning/Emergency)
     pub reversal_deviation: AtomicU64,
@@ -144,6 +146,7 @@ impl AppState {
             eth_up_price: AtomicU64::new(0),
             eth_down_price: AtomicU64::new(0),
             api_latency_ms: AtomicU64::new(0),
+            ws_latency_us: AtomicU64::new(0),
             reversal_deviation: AtomicU64::new(0),
             momentum_decaying: AtomicU8::new(0),
         })

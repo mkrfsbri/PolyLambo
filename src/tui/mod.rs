@@ -20,6 +20,7 @@ pub struct TuiSnapshot {
     pub balance_usdc: f64,
     pub pnl_usdc: f64,
     pub api_latency_ms: u64,
+    pub ws_latency_us: u64,
 
     pub btc_price: f64,
     pub btc_prev_price: f64,
@@ -54,7 +55,7 @@ pub struct OrderSnap {
 
 /// Blocking — must be called from std::thread::spawn, NOT tokio::spawn.
 /// Exits when the user presses 'q' or the watch sender is dropped.
-pub fn run_tui(mut rx: watch::Receiver<TuiSnapshot>) {
+pub fn run_tui(rx: watch::Receiver<TuiSnapshot>) {
     if enable_raw_mode().is_err() {
         return;
     }
