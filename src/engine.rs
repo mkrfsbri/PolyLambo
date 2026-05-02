@@ -270,8 +270,22 @@ pub async fn run_engine_loop(
                 let _ = clob.cancel_all().await;
                 break;
             }
-            let edge = 0.05_f64; // derive from spread in Phase 9+ refinement
-            let sz   = eng.half_kelly_size(edge, balance);
+            // Edge = how far the relevant outcome token is below fair value (0.5).
+            // When BTC is bullish and Up token is trading at e.g. 0.45, edge = 0.05.
+            // If the market has already repriced to >= 0.5, edge = 0 and we skip.
+            let token_price = match direction {
+                Direction::Up =>
+                    atomic_to_f64(eng.state.eth_up_price.load(Ordering::Acquire)),
+                Direction::Down =>
+                    atomic_to_f64(eng.state.eth_down_price.load(Ordering::Acquire)),
+            };
+            let edge = if token_price > 0.0 && token_price < 0.5 {
+                0.5 - token_price
+            } else {
+                0.0 // market already repriced — no edge
+            };
+            tracing::debug!("[ENGINE] token_price={token_price:.4} edge={edge:.4}");
+            let sz = eng.half_kelly_size(edge, balance);
             (sz, eng.config.dry_run, eng.config.order_ttl_secs, eng.state.clone())
         };
 
@@ -286,7 +300,7 @@ pub async fn run_engine_loop(
             );
             // Update momentum_decaying for TUI even in dry_run
             let decaying = {
-                let mut eng = engine.lock().await;
+                let eng = engine.lock().await;
                 eng.momentum.is_decaying()
             };
             state_arc.momentum_decaying.store(decaying as u8, Ordering::Release);

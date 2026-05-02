@@ -148,7 +148,8 @@ impl ClobClient {
         path: &str,
         body: &str,
     ) -> Result<Response> {
-        for attempt in 0..=1u8 {
+        // attempt 0: normal; attempt 1: retry after 429; attempt 2: retry after 401
+        for attempt in 0..=2u8 {
             let headers = self.hmac_auth_headers(method, path, body)?;
             let url = format!("{CLOB_BASE}{path}");
             let req = match method {
@@ -165,13 +166,20 @@ impl ClobClient {
 
             let resp = req.send().await.context("clob http send")?;
             match resp.status().as_u16() {
-                429 if attempt == 0 => {
+                429 if attempt < 2 => {
                     tracing::warn!("[CLOB] 429 rate-limited on {method} {path} — retry in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
+                401 if attempt < 2 => {
+                    // Re-sign: headers are regenerated at top of loop with a fresh timestamp.
+                    // Clock skew or a stale nonce can cause spurious 401s — one retry suffices.
+                    tracing::warn!("[CLOB] 401 on {method} {path} — re-signing and retrying");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
                 401 => {
-                    tracing::error!("[CLOB] 401 Unauthorized on {method} {path} — halting");
+                    tracing::error!("[CLOB] 401 Unauthorized on {method} {path} after re-sign — halting");
                     anyhow::bail!("CLOB 401 Unauthorized")
                 }
                 _ => return Ok(resp),

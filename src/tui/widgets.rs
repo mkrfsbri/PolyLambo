@@ -44,8 +44,9 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &TuiSnapshot) {
             ),
         ]),
         Line::from(format!(
-            "BALANCE: ${:.2}   PNL: {}{:.2}   LAT: {}ms",
-            snap.balance_usdc, pnl_sign, snap.pnl_usdc, snap.api_latency_ms
+            "BALANCE: ${:.2}   PNL: {}{:.2}   CLOB: {}ms   WS: {}μs",
+            snap.balance_usdc, pnl_sign, snap.pnl_usdc,
+            snap.api_latency_ms, snap.ws_latency_us
         )),
     ];
 

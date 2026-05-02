@@ -178,6 +178,7 @@ async fn build_snapshot(state: &state::AppState) -> tui::TuiSnapshot {
         balance_usdc:   state.balance_usdc.load(Ordering::Acquire) as f64 / 1_000_000.0,
         pnl_usdc:       state.pnl_usdc.load(Ordering::Acquire) as f64 / 100.0,
         api_latency_ms: state.api_latency_ms.load(Ordering::Acquire),
+        ws_latency_us:  state.ws_latency_us.load(Ordering::Acquire),
         btc_price:      state::atomic_to_f64(state.btc.price_raw.load(Ordering::Acquire)),
         btc_prev_price: state::atomic_to_f64(state.btc.price_prev.load(Ordering::Acquire)),
         btc_trend:      state.btc.trend.load(Ordering::Acquire),

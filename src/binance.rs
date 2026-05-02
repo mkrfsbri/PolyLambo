@@ -67,6 +67,7 @@ async fn connect_and_stream(state: Arc<AppState>, attempt: u32) -> Result<()> {
                 };
                 update_feed(&state, &trade);
                 let lat_us = t_recv.elapsed().as_micros();
+                state.ws_latency_us.store(lat_us as u64, Ordering::Release);
                 tracing::trace!("[BINANCE] ws_recv→store {}μs", lat_us);
                 if lat_us > LATENCY_BUDGET_US {
                     tracing::warn!(
