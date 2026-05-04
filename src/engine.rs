@@ -12,6 +12,10 @@ use crate::state::{AppState, OrderSide, atomic_to_f64, bot_status};
 
 const LOOP_INTERVAL_MS: u64 = 250;
 const EXPIRY_GUARD_SECS: u64 = 90;
+/// Hard floor: never open a new position inside the final 30 seconds.
+const MIN_ENTRY_EXPIRY_SECS: u64 = 30;
+/// Minimum token price to enter: below 5 ¢ the outcome is near-certain; skip.
+const MIN_TOKEN_PRICE: f64 = 0.05;
 
 // ── Direction ─────────────────────────────────────────────────────────────────
 
@@ -321,7 +325,7 @@ pub async fn run_engine_loop(
                     atomic_to_f64(eng.state.eth_down_price.load(Ordering::Acquire)),
             };
             const STALE_THRESHOLD: f64 = 0.65;
-            let edge = if token_price > 0.0 && token_price < STALE_THRESHOLD {
+            let edge = if token_price >= MIN_TOKEN_PRICE && token_price < STALE_THRESHOLD {
                 let score_edge = (score.abs() - eng.config.score_threshold).max(0.0);
                 let token_mispricing = if token_price < 0.5 { 0.5 - token_price } else { 0.0 };
                 score_edge + token_mispricing
@@ -339,7 +343,34 @@ pub async fn run_engine_loop(
             continue;
         }
 
+        // Hard expiry guard: refuse new entries in the final 30 seconds regardless of signal.
+        if expiry < MIN_ENTRY_EXPIRY_SECS {
+            tracing::debug!(
+                "[ENGINE] Expiry guard: {expiry}s remaining — new entries blocked"
+            );
+            continue;
+        }
+
         if dry_run {
+            let fake_id = format!(
+                "dry-{:016x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            );
+            state_arc.orders.insert(fake_id.clone(), crate::state::ActiveOrder {
+                order_id: fake_id.clone(),
+                side: match direction {
+                    Direction::Up   => OrderSide::Up,
+                    Direction::Down => OrderSide::Down,
+                },
+                price:     token_price_snap,
+                quantity:  size,
+                placed_at: Instant::now(),
+                status:    crate::state::OrderStatus::Pending,
+            });
+            state_arc.bot_status.store(bot_status::POSITION, Ordering::Release);
             tracing::info!(
                 "[ENGINE] DRY_RUN signal={:?} score={score:.3} size=${size:.2} expiry={expiry}s",
                 direction
@@ -356,6 +387,13 @@ pub async fn run_engine_loop(
             });
             let decaying = { engine.lock().await.momentum.is_decaying() };
             state_arc.momentum_decaying.store(decaying as u8, Ordering::Release);
+            // Watchdog: visible in Active Orders for TTL seconds, then clears
+            let state_w = state_arc.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
+                state_w.orders.remove(&fake_id);
+                state_w.bot_status.store(bot_status::HUNTING, Ordering::Release);
+            });
             continue;
         }
 
@@ -394,6 +432,14 @@ pub async fn run_engine_loop(
             tracing::warn!("[ENGINE] signal→order {}μs exceeds 500μs target", lat_us);
         }
 
+        state_arc.orders.insert(order_id.clone(), crate::state::ActiveOrder {
+            order_id: order_id.clone(),
+            side:     order_side.clone(),
+            price,
+            quantity: size,
+            placed_at: Instant::now(),
+            status:   crate::state::OrderStatus::Pending,
+        });
         state_arc.bot_status.store(bot_status::POSITION, Ordering::Release);
         tracing::info!(
             "[ENGINE] POSITION {:?} | ${size:.2} | price={price:.4} | ttl={ttl_secs}s | lat={}μs",

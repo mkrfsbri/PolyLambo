@@ -68,6 +68,8 @@ pub struct TuiSnapshot {
     pub score_threshold: f64,
     /// Last 5 completed trades, newest first
     pub history: Vec<TradeSnap>,
+    /// Present only when bot_status == POSITION
+    pub active_position: Option<PositionSnap>,
 }
 
 #[derive(Clone, Default)]
@@ -88,6 +90,16 @@ pub struct TradeSnap {
     pub price:  f64,
     pub qty:    f64,
     pub status: String,   // "Filled" | "Cancelled"
+}
+
+#[derive(Clone, Default)]
+pub struct PositionSnap {
+    pub side:           String,  // "UP" | "DN"
+    pub entry_price:    f64,     // token entry price (0–1)
+    pub current_price:  f64,     // current token mid price (0–1)
+    pub qty:            f64,     // USDC notional
+    pub elapsed_secs:   u64,
+    pub unrealized_pnl: f64,     // rough (current-entry)/entry * qty
 }
 
 // ── TUI entry point ───────────────────────────────────────────────────────────

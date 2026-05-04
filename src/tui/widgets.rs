@@ -4,7 +4,7 @@ use ratatui::{
 };
 
 use crate::state::{bot_status, trend};
-use super::{OrderSnap, TradeSnap, TuiSnapshot};
+use super::{OrderSnap, PositionSnap, TradeSnap, TuiSnapshot};
 
 // ── top-level render ──────────────────────────────────────────────────────────
 
@@ -12,9 +12,10 @@ pub fn render(frame: &mut Frame, snap: &TuiSnapshot) {
     let area = frame.size();
     let chunks = Layout::vertical([
         Constraint::Length(4), // header
-        Constraint::Length(7), // market (was 6, +1 for Score line)
+        Constraint::Length(7), // market
         Constraint::Min(5),    // active orders table
-        Constraint::Length(7), // history (new)
+        Constraint::Length(4), // active position
+        Constraint::Length(7), // history
         Constraint::Length(4), // protection status
     ])
     .split(area);
@@ -22,8 +23,9 @@ pub fn render(frame: &mut Frame, snap: &TuiSnapshot) {
     render_header(frame, chunks[0], snap);
     render_market(frame, chunks[1], snap);
     render_orders(frame, chunks[2], &snap.orders);
-    render_history(frame, chunks[3], &snap.history);
-    render_protection(frame, chunks[4], snap);
+    render_position(frame, chunks[3], snap.active_position.as_ref());
+    render_history(frame, chunks[4], &snap.history);
+    render_protection(frame, chunks[5], snap);
 }
 
 // ── sections ──────────────────────────────────────────────────────────────────
@@ -239,6 +241,50 @@ fn render_orders(frame: &mut Frame, area: Rect, orders: &[OrderSnap]) {
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(" Active Orders "));
     frame.render_widget(table, area);
+}
+
+fn render_position(frame: &mut Frame, area: Rect, pos: Option<&PositionSnap>) {
+    let block = Block::default().borders(Borders::ALL).title(" Active Position ");
+    let Some(p) = pos else {
+        frame.render_widget(
+            Paragraph::new("  No active position")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block),
+            area,
+        );
+        return;
+    };
+
+    let (side_label, side_color) = if p.side == "UP" {
+        ("\u{25b2} UP", Color::Green)
+    } else {
+        ("\u{25bc} DN", Color::Red)
+    };
+    let (cur_arrow, cur_color) = price_arrow(p.current_price, p.entry_price);
+    let pnl_color = if p.unrealized_pnl >= 0.0 { Color::Green } else { Color::Red };
+    let pnl_sign  = if p.unrealized_pnl >= 0.0 { "+" } else { "" };
+
+    let text = vec![
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(side_label, Style::default().fg(side_color).bold()),
+            Span::raw(format!("  Entry: {:.4}  Current: ", p.entry_price)),
+            Span::styled(
+                format!("{:.4}", p.current_price),
+                Style::default().fg(cur_color).bold(),
+            ),
+            Span::styled(cur_arrow, Style::default().fg(cur_color)),
+            Span::raw(format!("  Size: ${:.2}", p.qty)),
+        ]),
+        Line::from(vec![
+            Span::raw(format!("  Elapsed: {}s   Est. P&L: ", p.elapsed_secs)),
+            Span::styled(
+                format!("{}{:.3} USDC", pnl_sign, p.unrealized_pnl),
+                Style::default().fg(pnl_color).bold(),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 fn render_history(frame: &mut Frame, area: Rect, history: &[TradeSnap]) {

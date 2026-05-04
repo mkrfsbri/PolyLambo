@@ -273,5 +273,35 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
                 },
             }).collect()
         },
+        active_position: if state.bot_status.load(Ordering::Acquire) == state::bot_status::POSITION {
+            state.orders.iter().next().map(|entry| {
+                let o = entry.value();
+                let current_price = match o.side {
+                    state::OrderSide::Up =>
+                        state::atomic_to_f64(state.eth_up_price.load(Ordering::Acquire)),
+                    state::OrderSide::Down =>
+                        state::atomic_to_f64(state.eth_down_price.load(Ordering::Acquire)),
+                };
+                let elapsed_secs = o.placed_at.elapsed().as_secs();
+                let unrealized_pnl = if o.price > 0.0 {
+                    (current_price - o.price) / o.price * o.quantity
+                } else {
+                    0.0
+                };
+                tui::PositionSnap {
+                    side: match o.side {
+                        state::OrderSide::Up   => "UP".to_string(),
+                        state::OrderSide::Down => "DN".to_string(),
+                    },
+                    entry_price: o.price,
+                    current_price,
+                    qty: o.quantity,
+                    elapsed_secs,
+                    unrealized_pnl,
+                }
+            })
+        } else {
+            None
+        },
     }
 }
