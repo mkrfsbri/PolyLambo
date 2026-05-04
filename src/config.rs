@@ -14,6 +14,11 @@ pub struct Config {
     pub order_ttl_secs: u64,
     pub kelly_fraction: f64,
     pub dry_run: bool,
+    pub alpha: f64,
+    pub beta: f64,
+    pub v_scale: f64,
+    pub ptb_scale: f64,
+    pub score_threshold: f64,
 }
 
 impl Config {
@@ -45,6 +50,53 @@ impl Config {
             dry_run: env::var("DRY_RUN")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            alpha: env::var("ALPHA")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.6),
+            beta: env::var("BETA")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.4),
+            v_scale: env::var("V_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(10.0),
+            ptb_scale: env::var("PTB_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(2.0),
+            score_threshold: env::var("SCORE_THRESHOLD")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.15),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Serialize env-mutation tests to avoid race conditions
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_signal_param_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ALPHA");
+        std::env::remove_var("BETA");
+        std::env::remove_var("V_SCALE");
+        std::env::remove_var("PTB_SCALE");
+        std::env::remove_var("SCORE_THRESHOLD");
+        let cfg = Config::from_env().unwrap();
+        assert!((cfg.alpha - 0.6).abs() < 1e-9);
+        assert!((cfg.beta - 0.4).abs() < 1e-9);
+        assert!((cfg.v_scale - 10.0).abs() < 1e-9);
+        assert!((cfg.ptb_scale - 2.0).abs() < 1e-9);
+        assert!((cfg.score_threshold - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_signal_params_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ALPHA", "0.7");
+        std::env::set_var("SCORE_THRESHOLD", "0.20");
+        let cfg = Config::from_env().unwrap();
+        assert!((cfg.alpha - 0.7).abs() < 1e-9);
+        assert!((cfg.score_threshold - 0.20).abs() < 1e-9);
+        std::env::remove_var("ALPHA");
+        std::env::remove_var("SCORE_THRESHOLD");
     }
 }
