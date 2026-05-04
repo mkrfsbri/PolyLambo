@@ -19,7 +19,7 @@ const MIN_TOKEN_PRICE: f64 = 0.05;
 
 // ── Direction ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Direction {
     Up,
     Down,
@@ -371,6 +371,14 @@ pub async fn run_engine_loop(
                 status:    crate::state::OrderStatus::Pending,
             });
             state_arc.bot_status.store(bot_status::POSITION, Ordering::Release);
+
+            // Deduct entry cost from simulated balance at fill time.
+            let bal = atomic_to_f64(state_arc.balance_usdc.load(Ordering::Acquire));
+            state_arc.balance_usdc.store(
+                crate::state::f64_to_atomic((bal - size).max(0.0)),
+                Ordering::Release,
+            );
+
             tracing::info!(
                 "[ENGINE] DRY_RUN signal={:?} score={score:.3} size=${size:.2} expiry={expiry}s",
                 direction
@@ -385,12 +393,59 @@ pub async fn run_engine_loop(
                 qty:         size,
                 status:      crate::state::TradeStatus::Filled,
             });
+
             let decaying = { engine.lock().await.momentum.is_decaying() };
             state_arc.momentum_decaying.store(decaying as u8, Ordering::Release);
-            // Watchdog: visible in Active Orders for TTL seconds, then clears
-            let state_w = state_arc.clone();
+
+            // Capture PTB at fill time — after slug rotation it would belong to the new window.
+            let ptb_at_fill  = atomic_to_f64(state_arc.eth_open_price.load(Ordering::Acquire));
+            let initial_slug = state_arc.current_slug.read().await.clone();
+            let state_w      = state_arc.clone();
+
+            // Watchdog: hold the position until the market window rotates (= resolution).
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
+                // Loop until slug changes; snapshot ETH price on the last tick.
+                let eth_at_close = loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let poly = atomic_to_f64(state_w.eth_poly_spot.load(Ordering::Acquire));
+                    let eth = if poly > 0.0 {
+                        poly
+                    } else {
+                        atomic_to_f64(state_w.eth_spot_raw.load(Ordering::Acquire))
+                    };
+                    let slug = state_w.current_slug.read().await.clone();
+                    if !slug.is_empty() && slug != initial_slug {
+                        break eth;
+                    }
+                };
+
+                // Determine simulated outcome: did ETH beat the price-to-beat?
+                let won = ptb_at_fill > 0.0 && eth_at_close > 0.0 && match direction {
+                    Direction::Up   => eth_at_close > ptb_at_fill,
+                    Direction::Down => eth_at_close < ptb_at_fill,
+                };
+                // Each token pays $1 if won, $0 if lost; qty = size / entry_price.
+                let proceeds = if won && token_price_snap > 0.0 {
+                    size / token_price_snap
+                } else {
+                    0.0
+                };
+                let pnl = proceeds - size;
+
+                // Return proceeds to balance (cost was already deducted at fill).
+                let bal = atomic_to_f64(state_w.balance_usdc.load(Ordering::Acquire));
+                state_w.balance_usdc.store(
+                    crate::state::f64_to_atomic(bal + proceeds),
+                    Ordering::Release,
+                );
+                // Accumulate running P&L (stored as cents).
+                state_w.pnl_usdc.fetch_add((pnl * 100.0) as i64, Ordering::AcqRel);
+
+                tracing::info!(
+                    "[ENGINE] DRY_RUN resolved | dir={direction:?} won={won} \
+                     eth=${eth_at_close:.2} ptb=${ptb_at_fill:.2} pnl=${pnl:.2}"
+                );
+
                 state_w.orders.remove(&fake_id);
                 state_w.bot_status.store(bot_status::HUNTING, Ordering::Release);
             });
