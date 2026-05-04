@@ -1,6 +1,7 @@
 use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -32,6 +33,12 @@ pub struct BtcFeed {
     pub last_update_ms: AtomicU64,
     /// trend::NEUTRAL / BULL / BEAR
     pub trend: AtomicU8,
+}
+
+impl Default for BtcFeed {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BtcFeed {
@@ -78,6 +85,21 @@ pub struct ActiveOrder {
     pub status: OrderStatus,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TradeStatus {
+    Filled,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub closed_at:   chrono::DateTime<chrono::Utc>,
+    pub side:        OrderSide,
+    pub entry_price: f64,
+    pub qty:         f64,
+    pub status:      TradeStatus,
+}
+
 // ── bot status constants ─────────────────────────────────────────────────────
 
 pub mod bot_status {
@@ -99,8 +121,8 @@ pub struct AppState {
 
     /// USDC cents (signed)
     pub pnl_usdc: AtomicI64,
-    /// USDC cents
-    pub balance_usdc: AtomicI64,
+    /// USDC * 1_000_000 fixed-point
+    pub balance_usdc: AtomicU64,
 
     /// current Polymarket slug, e.g. "eth-updown-5m-1746000300"
     pub current_slug: RwLock<String>,
@@ -152,6 +174,10 @@ pub struct AppState {
     pub reversal_deviation: AtomicU64,
     /// 1 = momentum currently decaying, 0 = OK
     pub momentum_decaying: AtomicU8,
+    /// Composite signal score * 1_000_000 (signed; positive = Up signal, negative = Down)
+    pub signal_score: AtomicI64,
+    /// Completed trade records, newest first, capped at 50
+    pub trade_history: Mutex<VecDeque<TradeRecord>>,
 }
 
 impl AppState {
@@ -162,7 +188,7 @@ impl AppState {
             inventory_up: AtomicI64::new(0),
             inventory_down: AtomicI64::new(0),
             pnl_usdc: AtomicI64::new(0),
-            balance_usdc: AtomicI64::new(0),
+            balance_usdc: AtomicU64::new(0),
             current_slug: RwLock::new(String::new()),
             current_question: RwLock::new(String::new()),
             time_to_expiry_secs: AtomicU64::new(0),
@@ -186,6 +212,8 @@ impl AppState {
             ws_latency_us: AtomicU64::new(0),
             reversal_deviation: AtomicU64::new(0),
             momentum_decaying: AtomicU8::new(0),
+            signal_score: AtomicI64::new(0),
+            trade_history: Mutex::new(VecDeque::with_capacity(50)),
         })
     }
 }
@@ -252,6 +280,58 @@ mod tests {
         assert_eq!(cloned.order_id, "abc123");
         assert_eq!(cloned.side, OrderSide::Up);
         assert_eq!(cloned.status, OrderStatus::Pending);
+    }
+
+    #[test]
+    fn test_trade_history_cap_at_50() {
+        let state = AppState::new();
+        for _ in 0..55 {
+            let mut h = state.trade_history.lock().unwrap();
+            h.push_front(TradeRecord {
+                closed_at: chrono::Utc::now(),
+                side: OrderSide::Up,
+                entry_price: 0.52,
+                qty: 10.0,
+                status: TradeStatus::Filled,
+            });
+            h.truncate(50);
+        }
+        let h = state.trade_history.lock().unwrap();
+        assert_eq!(h.len(), 50);
+    }
+
+    #[test]
+    fn test_trade_history_newest_first() {
+        let state = AppState::new();
+        {
+            let mut h = state.trade_history.lock().unwrap();
+            h.push_front(TradeRecord {
+                closed_at: chrono::Utc::now(),
+                side: OrderSide::Up,
+                entry_price: 0.50,
+                qty: 5.0,
+                status: TradeStatus::Cancelled,
+            });
+            h.push_front(TradeRecord {
+                closed_at: chrono::Utc::now(),
+                side: OrderSide::Down,
+                entry_price: 0.48,
+                qty: 8.0,
+                status: TradeStatus::Filled,
+            });
+        }
+        let h = state.trade_history.lock().unwrap();
+        assert!((h[0].entry_price - 0.48).abs() < 1e-9, "newest first");
+        assert!((h[1].entry_price - 0.50).abs() < 1e-9, "oldest second");
+    }
+
+    #[test]
+    fn test_signal_score_atomic_roundtrip() {
+        let state = AppState::new();
+        let score: f64 = -0.372_111;
+        state.signal_score.store((score * 1_000_000.0) as i64, Ordering::Release);
+        let recovered = state.signal_score.load(Ordering::Acquire) as f64 / 1_000_000.0;
+        assert!((recovered - score).abs() < 1e-5);
     }
 
     #[test]
