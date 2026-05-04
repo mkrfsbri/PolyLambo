@@ -12,7 +12,7 @@ pub fn render(frame: &mut Frame, snap: &TuiSnapshot) {
     let area = frame.size();
     let chunks = Layout::vertical([
         Constraint::Length(4), // header: slug, status, balance, pnl, latency
-        Constraint::Length(5), // market: BTC, ETH5m prices, inventory
+        Constraint::Length(6), // market: BTC, ETH spot, POLY prices, inventory
         Constraint::Min(5),    // active orders table
         Constraint::Length(4), // protection status
     ])
@@ -34,7 +34,13 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &TuiSnapshot) {
         Line::from(vec![
             Span::raw("MARKET: "),
             Span::styled(
-                if snap.slug.is_empty() { "–".into() } else { snap.slug.clone() },
+                if !snap.question.is_empty() {
+                    snap.question.clone()
+                } else if !snap.slug.is_empty() {
+                    snap.slug.clone()
+                } else {
+                    "–".into()
+                },
                 Style::default().fg(Color::White).bold(),
             ),
             Span::raw("   STATUS: "),
@@ -43,11 +49,18 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &TuiSnapshot) {
                 Style::default().fg(s_color).bold(),
             ),
         ]),
-        Line::from(format!(
-            "BALANCE: ${:.2}   PNL: {}{:.2}   CLOB: {}ms   WS: {}μs",
-            snap.balance_usdc, pnl_sign, snap.pnl_usdc,
-            snap.api_latency_ms, snap.ws_latency_us
-        )),
+        {
+            let clob_lat = if snap.api_latency_ms == 0 {
+                "--".to_string()
+            } else {
+                format!("{}ms", snap.api_latency_ms)
+            };
+            Line::from(format!(
+                "BALANCE: ${:.2}   PNL: {}{:.2}   CLOB: {}   WS: {}μs",
+                snap.balance_usdc, pnl_sign, snap.pnl_usdc,
+                clob_lat, snap.ws_latency_us
+            ))
+        },
     ];
 
     let block = Block::default().borders(Borders::ALL).title(" eth5m-bot ");
@@ -55,7 +68,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &TuiSnapshot) {
 }
 
 fn render_market(frame: &mut Frame, area: Rect, snap: &TuiSnapshot) {
-    let pct = if snap.btc_prev_price > 0.0 {
+    let btc_pct = if snap.btc_prev_price > 0.0 {
         (snap.btc_price - snap.btc_prev_price) / snap.btc_prev_price * 100.0
     } else {
         0.0
@@ -71,17 +84,87 @@ fn render_market(frame: &mut Frame, area: Rect, snap: &TuiSnapshot) {
     let inv_up   = snap.inventory_up   as f64 / 1000.0;
     let inv_down = snap.inventory_down as f64 / 1000.0;
 
+    // ETH Binance live price arrow
+    let (eth_arrow, eth_color) = price_arrow(snap.eth_spot_price, snap.eth_spot_prev);
+
+    // ETH Poly reference / price-to-beat
+    let (ref_label, ref_color) = if snap.eth_open_price > 0.0 {
+        let diff = snap.eth_spot_price - snap.eth_open_price;
+        let sign = if diff >= 0.0 { "+" } else { "" };
+        let (_, col) = price_arrow(snap.eth_spot_price, snap.eth_open_price);
+        (format!("${:.2}  ({}{:.2})", snap.eth_open_price, sign, diff), col)
+    } else {
+        ("–".to_string(), Color::White)
+    };
+
+    // Polymarket UP/DOWN arrows (based on mid price movement)
+    let (up_arrow, up_color)     = price_arrow(snap.eth_up_price, snap.eth_up_prev);
+    let (down_arrow, down_color) = price_arrow(snap.eth_down_price, snap.eth_down_prev);
+
+    // UP bid/ask display — show "--" when orderbook not yet populated
+    let up_book = if snap.eth_up_bid > 0.0 && snap.eth_up_ask > 0.0 {
+        format!("{:.4}/{:.4}", snap.eth_up_bid, snap.eth_up_ask)
+    } else if snap.eth_up_price > 0.0 {
+        format!("{:.4} (mid)", snap.eth_up_price)
+    } else {
+        "--".to_string()
+    };
+    let dn_book = if snap.eth_down_bid > 0.0 && snap.eth_down_ask > 0.0 {
+        format!("{:.4}/{:.4}", snap.eth_down_bid, snap.eth_down_ask)
+    } else if snap.eth_down_price > 0.0 {
+        format!("{:.4} (mid)", snap.eth_down_price)
+    } else {
+        "--".to_string()
+    };
+
+    // POLY ETH = Polymarket live ETH price from RTDS.
+    // Falls back to the Binance feed when RTDS hasn't sent a price yet.
+    // This is intentionally separate from eth_open_price ("price to beat"),
+    // which is fixed at window-open and used as the static reference.
+    let (poly_eth_display, poly_eth_prev) = if snap.eth_poly_spot > 0.0 {
+        (snap.eth_poly_spot, snap.eth_poly_spot_prev)
+    } else {
+        (snap.eth_spot_price, snap.eth_spot_prev)
+    };
+    let (poly_eth_arrow, poly_eth_col) = price_arrow(poly_eth_display, poly_eth_prev);
+    let (poly_eth_label, poly_eth_color) = if poly_eth_display > 0.0 {
+        (format!("${:.2}{}", poly_eth_display, poly_eth_arrow), poly_eth_col)
+    } else {
+        ("–".to_string(), Color::White)
+    };
+
     let text = vec![
+        // BTC row
         Line::from(vec![
-            Span::raw(format!("BTC  : ${:>10.2}  ({:+.4}%)  ", snap.btc_price, pct)),
+            Span::raw(format!("BTC: ${:>10.2}  ({:+.4}%)  ", snap.btc_price, btc_pct)),
             Span::styled(trend_label, Style::default().fg(trend_color).bold()),
         ]),
+        // ETH Binance live + Poly reference price-to-beat
+        Line::from(vec![
+            Span::raw("ETH Binance: "),
+            Span::styled(
+                format!("${:.2}", snap.eth_spot_price),
+                Style::default().fg(eth_color).bold(),
+            ),
+            Span::styled(eth_arrow, Style::default().fg(eth_color)),
+            Span::raw("   Price to beat: "),
+            Span::styled(ref_label, Style::default().fg(ref_color).bold()),
+        ]),
+        // Polymarket orderbook bid/ask + Polymarket ETH reference price
+        Line::from(vec![
+            Span::raw("POLY UP (bid/ask): "),
+            Span::styled(up_book, Style::default().fg(up_color).bold()),
+            Span::styled(up_arrow, Style::default().fg(up_color)),
+            Span::raw("  DN: "),
+            Span::styled(dn_book, Style::default().fg(down_color).bold()),
+            Span::styled(down_arrow, Style::default().fg(down_color)),
+            Span::raw("   POLY ETH: "),
+            Span::styled(poly_eth_label, Style::default().fg(poly_eth_color).bold()),
+            Span::raw(format!("    {:02}:{:02} remaining", expiry_mm, expiry_ss)),
+        ]),
+        // Inventory
         Line::from(format!(
-            "ETH5m: UP ${:.4}  |  DOWN ${:.4}    {:02}:{:02} remaining",
-            snap.eth_up_price, snap.eth_down_price, expiry_mm, expiry_ss
-        )),
-        Line::from(format!(
-            "INV  : UP {:.3} shares  |  DOWN {:.3} shares",
+            "INV: UP {:.3} shares  |  DOWN {:.3} shares",
             inv_up, inv_down
         )),
     ];
@@ -185,6 +268,21 @@ fn status_str(s: u8) -> &'static str {
         bot_status::REVERSAL  => "REVERSAL",
         bot_status::EMERGENCY => "EMERGENCY",
         _ => "UNKNOWN",
+    }
+}
+
+/// Returns (arrow_str, color) based on whether current > prev.
+/// Returns ("", White) when prev is zero (no prior data yet).
+fn price_arrow(current: f64, prev: f64) -> (&'static str, Color) {
+    if prev <= 0.0 || current <= 0.0 {
+        return ("", Color::White);
+    }
+    if current > prev {
+        ("↑", Color::Green)
+    } else if current < prev {
+        ("↓", Color::Red)
+    } else {
+        ("", Color::White)
     }
 }
 

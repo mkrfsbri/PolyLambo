@@ -16,6 +16,8 @@ pub mod widgets;
 #[derive(Clone, Default)]
 pub struct TuiSnapshot {
     pub slug: String,
+    /// Human-readable market question text
+    pub question: String,
     pub bot_status: u8,
     pub balance_usdc: f64,
     pub pnl_usdc: f64,
@@ -26,8 +28,30 @@ pub struct TuiSnapshot {
     pub btc_prev_price: f64,
     pub btc_trend: u8,
 
+    /// ETH/USD spot price from Binance
+    pub eth_spot_price: f64,
+    pub eth_spot_prev: f64,
+    /// ETH/USD price when this 5-min window opened ("price to beat")
+    pub eth_open_price: f64,
+    /// Polymarket live ETH/USD price from RTDS feed
+    pub eth_poly_spot: f64,
+    pub eth_poly_spot_prev: f64,
+
+    /// Polymarket UP token mid price (0–1)
     pub eth_up_price: f64,
+    pub eth_up_prev: f64,
+    /// UP token best bid from CLOB orderbook
+    pub eth_up_bid: f64,
+    /// UP token best ask from CLOB orderbook
+    pub eth_up_ask: f64,
+    /// Polymarket DOWN token mid price (0–1)
     pub eth_down_price: f64,
+    pub eth_down_prev: f64,
+    /// DOWN token best bid from CLOB orderbook
+    pub eth_down_bid: f64,
+    /// DOWN token best ask from CLOB orderbook
+    pub eth_down_ask: f64,
+
     pub time_to_expiry_secs: u64,
 
     /// inventory_up * 1000 fixed-point

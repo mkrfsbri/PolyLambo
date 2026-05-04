@@ -2,10 +2,11 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::state::AppState;
+use crate::state::{AppState, f64_to_atomic};
 
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
 const POLL_INTERVAL_SECS: u64 = 10;
@@ -37,16 +38,6 @@ pub fn expiry_secs_for_ts(ts: u64) -> u64 {
 
 // ── API types ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct GammaEvent {
-    #[allow(dead_code)]
-    slug: String,
-    markets: Vec<GammaMarket>,
-}
-
-/// The Gamma API returns outcomePrices either as a native JSON array
-/// `["0.505","0.495"]` or as a JSON-encoded string `"[\"0.505\",\"0.495\"]"`.
-/// This deserializer handles both forms.
 /// Deserialize a JSON field that may be either a native array `["a","b"]`
 /// or a JSON-encoded string `"[\"a\",\"b\"]"` — both forms appear in Gamma API responses.
 fn deserialize_string_array<'de, D>(de: D) -> Result<Vec<String>, D::Error>
@@ -70,6 +61,16 @@ where
 }
 
 #[derive(Debug, Deserialize)]
+struct GammaEvent {
+    #[allow(dead_code)]
+    slug: String,
+    markets: Vec<GammaMarket>,
+    /// Event-level description — may contain the opening ETH reference price.
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GammaMarket {
     #[serde(rename = "clobTokenIds", deserialize_with = "deserialize_string_array")]
     clob_token_ids: Vec<String>,
@@ -80,6 +81,25 @@ struct GammaMarket {
     #[allow(dead_code)]
     #[serde(rename = "endDate")]
     end_date: String,
+    /// Market-level description — may also contain the opening reference price.
+    #[serde(default)]
+    description: String,
+}
+
+// ── reference price parser ────────────────────────────────────────────────────
+
+/// Extract the first dollar amount from a text string.
+/// Matches patterns like "$3,245.12", "$3245.12", "$3,245".
+/// Returns None if no parseable price is found or it is <= 0.
+fn parse_first_dollar_amount(text: &str) -> Option<f64> {
+    let start = text.find('$')?;
+    let rest = &text[start + 1..];
+    let price_str: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+        .filter(|c| *c != ',')
+        .collect();
+    price_str.parse::<f64>().ok().filter(|&p| p > 0.0)
 }
 
 // ── HTTP fetch ────────────────────────────────────────────────────────────────
@@ -91,6 +111,10 @@ pub struct MarketTokens {
     pub up_price: Option<f64>,
     /// Current Down outcome price (0.0–1.0). None if not available.
     pub down_price: Option<f64>,
+    /// Opening ETH/USD reference price from Polymarket ("price to beat"). None if not in description.
+    pub reference_price: Option<f64>,
+    /// Human-readable question text, e.g. "Ethereum Up or Down - May 2, 9:05AM ET"
+    pub question: String,
 }
 
 /// Fetch token IDs (and current prices) for the given slug.
@@ -126,59 +150,184 @@ pub async fn fetch_market_tokens(slug: &str, client: &Client) -> Result<MarketTo
     let up_price = market.outcome_prices.first().and_then(|s| s.parse().ok());
     let down_price = market.outcome_prices.get(1).and_then(|s| s.parse().ok());
 
+    // Try market description first, then event description for opening reference price
+    let reference_price = parse_first_dollar_amount(&market.description)
+        .or_else(|| parse_first_dollar_amount(&events[0].description));
+
     Ok(MarketTokens {
         up_token_id: market.clob_token_ids[0].clone(),
         down_token_id: market.clob_token_ids[1].clone(),
         up_price,
         down_price,
+        reference_price,
+        question: market.question.clone(),
     })
+}
+
+// ── CLOB orderbook refresh ────────────────────────────────────────────────────
+
+const CLOB_BASE: &str = "https://clob.polymarket.com";
+
+#[derive(Deserialize)]
+struct ClobBookLevel {
+    price: String,
+    #[allow(dead_code)]
+    size: String,
+}
+
+#[derive(Deserialize)]
+struct ClobBook {
+    bids: Vec<ClobBookLevel>,
+    asks: Vec<ClobBookLevel>,
+}
+
+/// Fetch best bid and best ask from the CLOB /book endpoint.
+/// Bids are sorted descending (bids[0] = highest), asks ascending (asks[0] = lowest).
+async fn fetch_clob_book_top(token_id: &str, client: &Client) -> (Option<f64>, Option<f64>) {
+    let url = format!("{CLOB_BASE}/book?token_id={token_id}");
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => return (None, None),
+    };
+    let book: ClobBook = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return (None, None),
+    };
+    let best_bid = book.bids.first().and_then(|l| l.price.parse().ok());
+    let best_ask = book.asks.first().and_then(|l| l.price.parse().ok());
+    (best_bid, best_ask)
+}
+
+/// Fetch UP/DOWN orderbook top-of-book from the CLOB REST API and write to state.
+/// Stores best bid, best ask, and mid price. Call every 1–2 s.
+pub async fn refresh_prices_from_clob(state: &AppState, client: &Client) {
+    let up_id   = state.up_token_id.read().await.clone();
+    let down_id = state.down_token_id.read().await.clone();
+    if up_id.is_empty() || down_id.is_empty() {
+        return;
+    }
+
+    let (up_bid, up_ask) = fetch_clob_book_top(&up_id, client).await;
+    if up_bid.is_some() || up_ask.is_some() {
+        let mid = match (up_bid, up_ask) {
+            (Some(b), Some(a)) => (b + a) / 2.0,
+            (Some(b), None)    => b,
+            (None,    Some(a)) => a,
+            _                  => unreachable!(),
+        };
+        let prev = state.eth_up_price.load(Ordering::Acquire);
+        state.eth_up_prev.store(prev, Ordering::Release);
+        state.eth_up_price.store(f64_to_atomic(mid), Ordering::Release);
+        if let Some(b) = up_bid  { state.eth_up_bid.store(f64_to_atomic(b), Ordering::Release); }
+        if let Some(a) = up_ask  { state.eth_up_ask.store(f64_to_atomic(a), Ordering::Release); }
+        tracing::trace!("[GAMMA] CLOB UP  bid={up_bid:?} ask={up_ask:?} mid={mid:.4}");
+    }
+
+    let (dn_bid, dn_ask) = fetch_clob_book_top(&down_id, client).await;
+    if dn_bid.is_some() || dn_ask.is_some() {
+        let mid = match (dn_bid, dn_ask) {
+            (Some(b), Some(a)) => (b + a) / 2.0,
+            (Some(b), None)    => b,
+            (None,    Some(a)) => a,
+            _                  => unreachable!(),
+        };
+        let prev = state.eth_down_price.load(Ordering::Acquire);
+        state.eth_down_prev.store(prev, Ordering::Release);
+        state.eth_down_price.store(f64_to_atomic(mid), Ordering::Release);
+        if let Some(b) = dn_bid  { state.eth_down_bid.store(f64_to_atomic(b), Ordering::Release); }
+        if let Some(a) = dn_ask  { state.eth_down_ask.store(f64_to_atomic(a), Ordering::Release); }
+        tracing::trace!("[GAMMA] CLOB DOWN bid={dn_bid:?} ask={dn_ask:?} mid={mid:.4}");
+    }
 }
 
 // ── discovery loop ────────────────────────────────────────────────────────────
 
-/// Long-running task: polls every 10s, updates AppState when the slug changes.
+/// Apply UP/DOWN token prices from a fetched result to shared state.
+fn apply_poly_prices(state: &AppState, tokens: &MarketTokens) {
+    if let Some(p) = tokens.up_price {
+        let prev = state.eth_up_price.load(Ordering::Acquire);
+        state.eth_up_prev.store(prev, Ordering::Release);
+        state.eth_up_price.store(f64_to_atomic(p), Ordering::Release);
+    }
+    if let Some(p) = tokens.down_price {
+        let prev = state.eth_down_price.load(Ordering::Acquire);
+        state.eth_down_prev.store(prev, Ordering::Release);
+        state.eth_down_price.store(f64_to_atomic(p), Ordering::Release);
+    }
+}
+
+/// Long-running task: polls every 10s.
+///
+/// - Updates slug + token IDs + question only when the window changes.
+/// - Always refreshes UP/DOWN token prices so the TUI stays live.
+/// - When the window changes but the new slug isn't live yet, refreshes prices
+///   from the old slug so POLY prices don't go stale during the transition.
+/// - Sets eth_open_price ("price to beat") from the Polymarket-recorded
+///   closing price of the just-finished window (its description after
+///   settlement); falls back to the new window's description, then live
+///   Binance spot.
 pub async fn discover_and_update(state: Arc<AppState>, client: Client) {
     loop {
         let slug = compute_next_slug();
         let ts = Utc::now().timestamp() as u64;
-
-        // Only re-fetch when the slug has changed
         let current = state.current_slug.read().await.clone();
-        if slug != current {
+        let slug_changed = slug != current;
+
+        if slug_changed {
+            // New window: try the upcoming slug, fall back to old slug for prices.
             match fetch_market_tokens(&slug, &client).await {
                 Ok(tokens) => {
                     tracing::info!(
-                        "[GAMMA] Slug: {slug} | UP: {} | DOWN: {}",
-                        tokens.up_token_id,
-                        tokens.down_token_id,
+                        "[GAMMA] New window: {slug} | q: {} | ref_price: {:?}",
+                        tokens.question,
+                        tokens.reference_price,
                     );
-                    *state.current_slug.write().await = slug;
-                    *state.up_token_id.write().await = tokens.up_token_id;
-                    *state.down_token_id.write().await = tokens.down_token_id;
-                    if let Some(p) = tokens.up_price {
-                        state.eth_up_price.store(
-                            crate::state::f64_to_atomic(p),
-                            std::sync::atomic::Ordering::Release,
-                        );
+                    *state.current_slug.write().await = slug.clone();
+                    *state.up_token_id.write().await = tokens.up_token_id.clone();
+                    *state.down_token_id.write().await = tokens.down_token_id.clone();
+                    *state.current_question.write().await = tokens.question.clone();
+
+                    // Price-to-beat: prefer Polymarket's own reference price
+                    // recorded in the market description (most authoritative).
+                    // The boundary timer in poly_ws handles the Binance-spot
+                    // fallback at the exact 300-second window boundary, so we
+                    // do NOT fall back to live Binance spot here — that would
+                    // capture the price up to 10 s after window open.
+                    let prev_ref = if !current.is_empty() {
+                        fetch_market_tokens(&current, &client).await
+                            .ok()
+                            .and_then(|t| t.reference_price)
+                    } else {
+                        None
+                    };
+                    if let Some(open) = prev_ref.or(tokens.reference_price).filter(|&p| p > 0.0) {
+                        state.eth_open_price.store(f64_to_atomic(open), Ordering::Release);
+                        tracing::info!("[GAMMA] price-to-beat from description: ${open:.2}");
                     }
-                    if let Some(p) = tokens.down_price {
-                        state.eth_down_price.store(
-                            crate::state::f64_to_atomic(p),
-                            std::sync::atomic::Ordering::Release,
-                        );
-                    }
+
+                    apply_poly_prices(&state, &tokens);
                 }
                 Err(e) => {
-                    tracing::warn!("[GAMMA] Slug {slug} not yet available: {e:#}");
+                    tracing::warn!("[GAMMA] New slug {slug} not yet available: {e:#}");
+                    // Keep POLY prices fresh from the still-active old market.
+                    if !current.is_empty() {
+                        match fetch_market_tokens(&current, &client).await {
+                            Ok(tokens) => apply_poly_prices(&state, &tokens),
+                            Err(e2) => tracing::warn!("[GAMMA] Old slug price refresh: {e2:#}"),
+                        }
+                    }
                 }
+            }
+        } else if !current.is_empty() {
+            // Same window: refresh prices only.
+            match fetch_market_tokens(&current, &client).await {
+                Ok(tokens) => apply_poly_prices(&state, &tokens),
+                Err(e) => tracing::warn!("[GAMMA] Price refresh failed: {e:#}"),
             }
         }
 
-        // Always refresh expiry countdown
-        let expiry = expiry_secs_for_ts(ts);
-        state
-            .time_to_expiry_secs
-            .store(expiry, std::sync::atomic::Ordering::Release);
+        // Always refresh expiry countdown.
+        state.time_to_expiry_secs.store(expiry_secs_for_ts(ts), Ordering::Release);
 
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
     }
@@ -297,6 +446,40 @@ mod tests {
         assert!(market.clob_token_ids[0].starts_with("665"));
         let up_price: f64 = market.outcome_prices[0].parse().unwrap();
         assert!((up_price - 0.505).abs() < 1e-6);
+    }
+
+    // ── reference price parser ────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_dollar_amount_with_commas() {
+        assert!((parse_first_dollar_amount("Opening price: $3,245.12 ETH").unwrap() - 3245.12).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_dollar_amount_no_commas() {
+        assert!((parse_first_dollar_amount("ref $1800.50").unwrap() - 1800.50).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_dollar_amount_none_when_absent() {
+        assert!(parse_first_dollar_amount("no price here").is_none());
+    }
+
+    #[test]
+    fn test_parse_dollar_amount_from_event_description() {
+        let json = r#"[{
+            "slug": "eth-updown-5m-1777727100",
+            "description": "Will ETH close higher? Opening price: $3,245.12",
+            "markets": [{
+                "question": "Ethereum Up or Down - May 2, 9:05AM-9:10AM ET",
+                "clobTokenIds": ["aaa", "bbb"],
+                "outcomePrices": ["0.505", "0.495"],
+                "endDate": "2026-05-02T13:10:00Z"
+            }]
+        }]"#;
+        let events: Vec<GammaEvent> = serde_json::from_str(json).unwrap();
+        let ref_price = parse_first_dollar_amount(&events[0].description);
+        assert!((ref_price.unwrap() - 3245.12).abs() < 1e-6);
     }
 
     #[test]

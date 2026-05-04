@@ -104,6 +104,8 @@ pub struct AppState {
 
     /// current Polymarket slug, e.g. "eth-updown-5m-1746000300"
     pub current_slug: RwLock<String>,
+    /// human-readable market question, e.g. "Ethereum Up or Down - May 2, 9:05AM ET"
+    pub current_question: RwLock<String>,
     /// seconds until market window expires
     pub time_to_expiry_secs: AtomicU64,
 
@@ -113,10 +115,33 @@ pub struct AppState {
     pub up_token_id: RwLock<String>,
     pub down_token_id: RwLock<String>,
 
-    /// ETH Up outcome price * 1_000_000
+    /// ETH Up outcome price * 1_000_000 (Polymarket token mid price 0–1)
     pub eth_up_price: AtomicU64,
-    /// ETH Down outcome price * 1_000_000
+    /// previous ETH Up price — used for ↑/↓ indicator in TUI
+    pub eth_up_prev: AtomicU64,
+    /// ETH Up best bid from CLOB orderbook * 1_000_000
+    pub eth_up_bid: AtomicU64,
+    /// ETH Up best ask from CLOB orderbook * 1_000_000
+    pub eth_up_ask: AtomicU64,
+    /// ETH Down outcome price * 1_000_000 (Polymarket token mid price 0–1)
     pub eth_down_price: AtomicU64,
+    /// previous ETH Down price — used for ↑/↓ indicator in TUI
+    pub eth_down_prev: AtomicU64,
+    /// ETH Down best bid from CLOB orderbook * 1_000_000
+    pub eth_down_bid: AtomicU64,
+    /// ETH Down best ask from CLOB orderbook * 1_000_000
+    pub eth_down_ask: AtomicU64,
+
+    /// ETH/USD spot price from Binance * 1_000_000
+    pub eth_spot_raw: AtomicU64,
+    /// previous ETH/USD spot price * 1_000_000
+    pub eth_spot_prev: AtomicU64,
+    /// ETH/USD price at window open ("price to beat") * 1_000_000
+    pub eth_open_price: AtomicU64,
+    /// Polymarket live ETH/USD price from RTDS feed * 1_000_000
+    pub eth_poly_spot: AtomicU64,
+    /// previous Polymarket ETH/USD price * 1_000_000
+    pub eth_poly_spot_prev: AtomicU64,
 
     /// last measured CLOB API round-trip ms
     pub api_latency_ms: AtomicU64,
@@ -139,12 +164,24 @@ impl AppState {
             pnl_usdc: AtomicI64::new(0),
             balance_usdc: AtomicI64::new(0),
             current_slug: RwLock::new(String::new()),
+            current_question: RwLock::new(String::new()),
             time_to_expiry_secs: AtomicU64::new(0),
             bot_status: AtomicU8::new(bot_status::HUNTING),
             up_token_id: RwLock::new(String::new()),
             down_token_id: RwLock::new(String::new()),
             eth_up_price: AtomicU64::new(0),
+            eth_up_prev: AtomicU64::new(0),
+            eth_up_bid: AtomicU64::new(0),
+            eth_up_ask: AtomicU64::new(0),
             eth_down_price: AtomicU64::new(0),
+            eth_down_prev: AtomicU64::new(0),
+            eth_down_bid: AtomicU64::new(0),
+            eth_down_ask: AtomicU64::new(0),
+            eth_spot_raw: AtomicU64::new(0),
+            eth_spot_prev: AtomicU64::new(0),
+            eth_open_price: AtomicU64::new(0),
+            eth_poly_spot: AtomicU64::new(0),
+            eth_poly_spot_prev: AtomicU64::new(0),
             api_latency_ms: AtomicU64::new(0),
             ws_latency_us: AtomicU64::new(0),
             reversal_deviation: AtomicU64::new(0),
