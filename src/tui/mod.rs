@@ -62,6 +62,12 @@ pub struct TuiSnapshot {
     pub orders: Vec<OrderSnap>,
     pub reversal_warning: Option<f64>,
     pub momentum_decaying: bool,
+    /// Composite signal score from engine (-1..+1 range)
+    pub signal_score: f64,
+    /// Score threshold from Config — used by widgets for colour cutoff
+    pub score_threshold: f64,
+    /// Last 5 completed trades, newest first
+    pub history: Vec<TradeSnap>,
 }
 
 #[derive(Clone, Default)]
@@ -73,6 +79,15 @@ pub struct OrderSnap {
     pub status: String,
     /// u64::MAX = unknown/not applicable
     pub ttl_secs: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct TradeSnap {
+    pub time:   String,   // "HH:MM:SS"
+    pub side:   String,   // "UP" | "DN"
+    pub price:  f64,
+    pub qty:    f64,
+    pub status: String,   // "Filled" | "Cancelled"
 }
 
 // ── TUI entry point ───────────────────────────────────────────────────────────

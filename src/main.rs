@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     if cfg.dry_run {
         // Simulate $1 000 balance
         state.balance_usdc.store(
-            state::f64_to_atomic(1_000.0) as i64,
+            state::f64_to_atomic(1_000.0),
             Ordering::Release,
         );
         tracing::info!("[PREFLIGHT] DRY_RUN — balance=$1000 simulated");
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         let balance = clob.get_balance().await.context("balance check")?;
         anyhow::ensure!(balance > 1.0, "balance ${balance:.2} < $1 — abort");
         state.balance_usdc.store(
-            state::f64_to_atomic(balance) as i64,
+            state::f64_to_atomic(balance),
             Ordering::Release,
         );
         tracing::info!("[PREFLIGHT] Balance: ${balance:.2}");
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
 
     // ── validate slug reachable (non-blocking for dry_run) ───────────────────
     if !cfg.dry_run {
-        let slug = gamma::compute_next_slug();
+        let slug = gamma::compute_current_slug();
         gamma::fetch_market_tokens(&slug, &reqwest::Client::new())
             .await
             .with_context(|| format!("[PREFLIGHT] slug {slug} not resolvable"))?;
@@ -140,11 +140,12 @@ async fn main() -> Result<()> {
 
     // Push snapshots to TUI at 100 ms
     let state_snap = state.clone();
+    let score_threshold = cfg.score_threshold;
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
         loop {
             ticker.tick().await;
-            let snap = build_snapshot(&state_snap).await;
+            let snap = build_snapshot(&state_snap, score_threshold).await;
             if tui_tx.send(snap).is_err() {
                 break;
             }
@@ -162,7 +163,7 @@ async fn main() -> Result<()> {
                 match clob_bm.get_balance().await {
                     Ok(bal) => {
                         state_bm.balance_usdc.store(
-                            state::f64_to_atomic(bal) as i64,
+                            state::f64_to_atomic(bal),
                             Ordering::Release,
                         );
                         if bal < 1.0 {
@@ -204,12 +205,12 @@ async fn main() -> Result<()> {
 
 // ── snapshot builder ──────────────────────────────────────────────────────────
 
-async fn build_snapshot(state: &state::AppState) -> tui::TuiSnapshot {
+async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::TuiSnapshot {
     tui::TuiSnapshot {
         slug:           state.current_slug.read().await.clone(),
         question:       state.current_question.read().await.clone(),
         bot_status:     state.bot_status.load(Ordering::Acquire),
-        balance_usdc:   state.balance_usdc.load(Ordering::Acquire) as f64 / 1_000_000.0,
+        balance_usdc:   state::atomic_to_f64(state.balance_usdc.load(Ordering::Acquire)),
         pnl_usdc:       state.pnl_usdc.load(Ordering::Acquire) as f64 / 100.0,
         api_latency_ms: state.api_latency_ms.load(Ordering::Acquire),
         ws_latency_us:  state.ws_latency_us.load(Ordering::Acquire),
@@ -250,5 +251,27 @@ async fn build_snapshot(state: &state::AppState) -> tui::TuiSnapshot {
             if dev > 0.0 { Some(dev) } else { None }
         },
         momentum_decaying: state.momentum_decaying.load(Ordering::Acquire) != 0,
+        signal_score: {
+            let raw = state.signal_score.load(Ordering::Acquire);
+            raw as f64 / 1_000_000.0
+        },
+        score_threshold,
+        history: {
+            use state::{OrderSide, TradeStatus};
+            let h = state.trade_history.lock().unwrap();
+            h.iter().take(5).map(|r| tui::TradeSnap {
+                time: r.closed_at.format("%H:%M:%S").to_string(),
+                side: match r.side {
+                    OrderSide::Up   => "UP".to_string(),
+                    OrderSide::Down => "DN".to_string(),
+                },
+                price:  r.entry_price,
+                qty:    r.qty,
+                status: match r.status {
+                    TradeStatus::Filled    => "Filled".to_string(),
+                    TradeStatus::Cancelled => "Cancelled".to_string(),
+                },
+            }).collect()
+        },
     }
 }
