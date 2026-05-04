@@ -368,7 +368,7 @@ pub async fn run_engine_loop(
                 price:     token_price_snap,
                 quantity:  size,
                 placed_at: Instant::now(),
-                status:    crate::state::OrderStatus::Pending,
+                status:    crate::state::OrderStatus::Filled,
             });
             state_arc.bot_status.store(bot_status::POSITION, Ordering::Release);
 

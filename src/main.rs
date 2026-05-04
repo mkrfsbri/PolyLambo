@@ -274,7 +274,7 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
             }).collect()
         },
         active_position: if state.bot_status.load(Ordering::Acquire) == state::bot_status::POSITION {
-            state.orders.iter().next().map(|entry| {
+            state.orders.iter().find(|e| e.value().status == state::OrderStatus::Filled).map(|entry| {
                 let o = entry.value();
                 let current_price = match o.side {
                     state::OrderSide::Up =>
