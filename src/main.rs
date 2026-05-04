@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use eth5m_bot::{binance, clob, config, engine, gamma, state, tui};
+use eth5m_bot::{binance, clob, config, engine, gamma, poly_ws, state, tui};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{watch, Mutex};
@@ -59,13 +59,46 @@ async fn main() -> Result<()> {
         tracing::info!("[PREFLIGHT] Balance: ${balance:.2}");
     }
 
-    // ── spawn BTC + gamma tasks early so BTC warms up ─────────────────────────
+    // ── spawn BTC + ETH + gamma tasks early so feeds warm up ─────────────────
     let state_b = state.clone();
     let btc_task = tokio::spawn(async move { binance::run_btc_feed(state_b).await });
+
+    let state_eth = state.clone();
+    tokio::spawn(async move { binance::run_eth_feed(state_eth).await });
 
     let state_g = state.clone();
     let http = reqwest::Client::new();
     tokio::spawn(async move { gamma::discover_and_update(state_g, http).await });
+
+    // CLOB REST fallback: seeds eth_up/down_bid/ask every 5 s so the TUI
+    // always has book data even before the CLOB WebSocket delivers its first
+    // snapshot.  The CLOB WS overwrites these with real-time values.
+    let state_rf = state.clone();
+    let http_rf  = reqwest::Client::new();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            gamma::refresh_prices_from_clob(&state_rf, &http_rf).await;
+        }
+    });
+
+    // CLOB WebSocket: real-time order books. Requires WS auth — skip in dry-run
+    // (the REST fallback in refresh_prices_from_clob seeds bid/ask every 5 s).
+    if !cfg.dry_run {
+        let state_cw = state.clone();
+        tokio::spawn(async move { poly_ws::run_clob_ws(state_cw).await });
+    }
+
+    // RTDS WebSocket: Polymarket live data — captures ETH/USD price at window
+    // open to use as the authoritative "price to beat".
+    let state_rt = state.clone();
+    tokio::spawn(async move { poly_ws::run_rtds_ws(state_rt).await });
+
+    // Boundary timer: snapshots Binance ETH spot at every 300-second UTC
+    // boundary as the fallback price-to-beat when RTDS does not provide one.
+    let state_bt = state.clone();
+    tokio::spawn(async move { poly_ws::run_open_price_boundary(state_bt).await });
 
     // Wait up to 5 s for a real BTC price
     let btc_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -174,6 +207,7 @@ async fn main() -> Result<()> {
 async fn build_snapshot(state: &state::AppState) -> tui::TuiSnapshot {
     tui::TuiSnapshot {
         slug:           state.current_slug.read().await.clone(),
+        question:       state.current_question.read().await.clone(),
         bot_status:     state.bot_status.load(Ordering::Acquire),
         balance_usdc:   state.balance_usdc.load(Ordering::Acquire) as f64 / 1_000_000.0,
         pnl_usdc:       state.pnl_usdc.load(Ordering::Acquire) as f64 / 100.0,
@@ -182,8 +216,19 @@ async fn build_snapshot(state: &state::AppState) -> tui::TuiSnapshot {
         btc_price:      state::atomic_to_f64(state.btc.price_raw.load(Ordering::Acquire)),
         btc_prev_price: state::atomic_to_f64(state.btc.price_prev.load(Ordering::Acquire)),
         btc_trend:      state.btc.trend.load(Ordering::Acquire),
+        eth_spot_price:     state::atomic_to_f64(state.eth_spot_raw.load(Ordering::Acquire)),
+        eth_spot_prev:      state::atomic_to_f64(state.eth_spot_prev.load(Ordering::Acquire)),
+        eth_open_price:     state::atomic_to_f64(state.eth_open_price.load(Ordering::Acquire)),
+        eth_poly_spot:      state::atomic_to_f64(state.eth_poly_spot.load(Ordering::Acquire)),
+        eth_poly_spot_prev: state::atomic_to_f64(state.eth_poly_spot_prev.load(Ordering::Acquire)),
         eth_up_price:   state::atomic_to_f64(state.eth_up_price.load(Ordering::Acquire)),
+        eth_up_prev:    state::atomic_to_f64(state.eth_up_prev.load(Ordering::Acquire)),
+        eth_up_bid:     state::atomic_to_f64(state.eth_up_bid.load(Ordering::Acquire)),
+        eth_up_ask:     state::atomic_to_f64(state.eth_up_ask.load(Ordering::Acquire)),
         eth_down_price: state::atomic_to_f64(state.eth_down_price.load(Ordering::Acquire)),
+        eth_down_prev:  state::atomic_to_f64(state.eth_down_prev.load(Ordering::Acquire)),
+        eth_down_bid:   state::atomic_to_f64(state.eth_down_bid.load(Ordering::Acquire)),
+        eth_down_ask:   state::atomic_to_f64(state.eth_down_ask.load(Ordering::Acquire)),
         time_to_expiry_secs: state.time_to_expiry_secs.load(Ordering::Acquire),
         inventory_up:   state.inventory_up.load(Ordering::Acquire),
         inventory_down: state.inventory_down.load(Ordering::Acquire),

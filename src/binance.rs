@@ -12,7 +12,8 @@ const LATENCY_BUDGET_US: u128 = 100; // ws_receive→price_update target < 100 �
 
 use crate::state::{AppState, atomic_to_f64, f64_to_atomic, trend};
 
-const WS_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
+const WS_URL: &str     = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
+const WS_URL_ETH: &str = "wss://stream.binance.com:9443/ws/ethusdt@aggTrade";
 
 #[derive(Debug, Deserialize)]
 struct AggTrade {
@@ -129,6 +130,72 @@ fn update_feed(state: &AppState, trade: &AggTrade) {
 /// Read current BTC price from shared state (lock-free Acquire).
 pub fn get_btc_price(state: &AppState) -> f64 {
     atomic_to_f64(state.btc.price_raw.load(Ordering::Acquire))
+}
+
+// ── ETH/USD feed ──────────────────────────────────────────────────────────────
+
+/// Long-running task: streams ETH/USD aggTrades from Binance.
+pub async fn run_eth_feed(state: Arc<AppState>) -> Result<()> {
+    let mut attempt = 0u32;
+    Retry::spawn(
+        ExponentialBackoff::from_millis(1000)
+            .max_delay(Duration::from_secs(30))
+            .take(10),
+        || {
+            attempt += 1;
+            let state = state.clone();
+            let n = attempt;
+            async move { connect_and_stream_eth(state, n).await }
+        },
+    )
+    .await
+}
+
+async fn connect_and_stream_eth(state: Arc<AppState>, attempt: u32) -> Result<()> {
+    let (mut ws, _) = connect_async(WS_URL_ETH)
+        .await
+        .context("binance eth ws connect")?;
+
+    if attempt == 1 {
+        tracing::info!("[BINANCE] ETH feed connected");
+    } else {
+        tracing::info!("[BINANCE] ETH feed reconnect #{attempt}");
+    }
+
+    while let Some(msg) = ws.next().await {
+        match msg.context("binance eth ws read")? {
+            Message::Text(text) => {
+                let trade: AggTrade = match serde_json::from_str(&text) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                update_eth_feed(&state, &trade);
+            }
+            Message::Close(_) => {
+                tracing::warn!("[BINANCE] ETH feed closed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("binance eth ws stream ended")
+}
+
+#[inline]
+fn update_eth_feed(state: &AppState, trade: &AggTrade) {
+    let price: f64 = match trade.price.parse() {
+        Ok(p) if p > 0.0 => p,
+        _ => return,
+    };
+    let prev_raw = state.eth_spot_raw.load(Ordering::Acquire);
+    state.eth_spot_prev.store(prev_raw, Ordering::Release);
+    state.eth_spot_raw.store(f64_to_atomic(price), Ordering::Release);
+    tracing::trace!("[BINANCE] ETH: ${price:.2}");
+}
+
+/// Read current ETH/USD spot price from shared state (lock-free Acquire).
+pub fn get_eth_price(state: &AppState) -> f64 {
+    atomic_to_f64(state.eth_spot_raw.load(Ordering::Acquire))
 }
 
 // ── tests ──��─────────────────────────────────────────────────────────────────
