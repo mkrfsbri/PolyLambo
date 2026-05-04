@@ -4,9 +4,11 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+use chrono::Utc;
+
 use crate::binance::get_btc_price;
 use crate::config::Config;
-use crate::state::{AppState, OrderSide, atomic_to_f64, bot_status, trend};
+use crate::state::{AppState, OrderSide, atomic_to_f64, bot_status};
 
 const LOOP_INTERVAL_MS: u64 = 250;
 const EXPIRY_GUARD_SECS: u64 = 90;
@@ -162,8 +164,15 @@ impl TradingEngine {
         }
     }
 
-    /// Push latest BTC price into momentum window and return a trading signal.
-    pub fn compute_signal(&mut self, ts_ms: u64, btc_price: f64) -> Option<Direction> {
+    /// Compute composite signal score from BTC momentum and PTB displacement.
+    /// Returns Some((direction, score)) when |score| > threshold, else None.
+    pub fn compute_signal(
+        &mut self,
+        ts_ms: u64,
+        btc_price: f64,
+        eth_live: f64,
+        ptb: f64,
+    ) -> Option<(Direction, f64)> {
         self.momentum.push(ts_ms, btc_price);
 
         let expiry = self.state.time_to_expiry_secs.load(Ordering::Acquire);
@@ -172,10 +181,27 @@ impl TradingEngine {
             return None;
         }
 
-        match self.state.btc.trend.load(Ordering::Acquire) {
-            t if t == trend::BULL => Some(Direction::Up),
-            t if t == trend::BEAR => Some(Direction::Down),
-            _ => None,
+        let velocity  = self.momentum.velocity();
+        let btc_norm  = (velocity / self.config.v_scale).clamp(-1.0, 1.0);
+
+        let ptb_norm = if ptb > 0.0 && eth_live > 0.0 {
+            let ptb_pct = (eth_live - ptb) / ptb * 100.0;
+            (ptb_pct / self.config.ptb_scale).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let score = self.config.alpha * btc_norm + self.config.beta * ptb_norm;
+        tracing::debug!(
+            "[ENGINE] vel={velocity:.2} btc_norm={btc_norm:.3} ptb_norm={ptb_norm:.3} score={score:.3}"
+        );
+
+        if score > self.config.score_threshold {
+            Some((Direction::Up, score))
+        } else if score < -self.config.score_threshold {
+            Some((Direction::Down, score))
+        } else {
+            None
         }
     }
 
@@ -183,7 +209,7 @@ impl TradingEngine {
     /// `edge` = estimated win probability minus 0.5 (e.g. 0.05 = 55% win rate).
     pub fn half_kelly_size(&self, edge: f64, balance: f64) -> f64 {
         let fraction = (2.0 * edge) * self.config.kelly_fraction;
-        fraction.max(0.0).min(0.1) * balance
+        fraction.clamp(0.0, 0.1) * balance
     }
 }
 
@@ -209,6 +235,19 @@ pub async fn run_engine_loop(
         if btc_price == 0.0 || ts_ms == 0 {
             continue; // BTC feed not yet connected
         }
+
+        // Read composite signal inputs from state
+        let (eth_live, ptb) = {
+            let eng = engine.lock().await;
+            let poly = atomic_to_f64(eng.state.eth_poly_spot.load(Ordering::Acquire));
+            let eth  = if poly > 0.0 {
+                poly
+            } else {
+                atomic_to_f64(eng.state.eth_spot_raw.load(Ordering::Acquire))
+            };
+            let p = atomic_to_f64(eng.state.eth_open_price.load(Ordering::Acquire));
+            (eth, p)
+        };
 
         // ── reversal check + state broadcast ──────────────────────────────
         let reversal = { engine.lock().await.check_reversal(btc_price) };
@@ -244,54 +283,56 @@ pub async fn run_engine_loop(
 
         // ── skip if already in a position or emergency ─────────────────────
         let status = engine.lock().await.state.bot_status.load(Ordering::Acquire);
-        if matches!(status, s if s == bot_status::EMERGENCY || s == bot_status::POSITION) {
+        if status == bot_status::EMERGENCY || status == bot_status::POSITION {
             continue;
         }
 
         // ── compute signal ─────────────────────────────────────────────────
-        let direction = {
+        let signal_result = {
             let mut eng = engine.lock().await;
-            match eng.compute_signal(ts_ms, btc_price) {
-                Some(d) => d,
-                None => continue,
+            eng.compute_signal(ts_ms, btc_price, eth_live, ptb)
+        };
+        let (direction, score) = match signal_result {
+            Some(pair) => pair,
+            None => {
+                engine.lock().await.state.signal_score.store(0, Ordering::Release);
+                continue;
             }
         };
+        engine.lock().await.state.signal_score.store(
+            (score * 1_000_000.0) as i64,
+            Ordering::Release,
+        );
 
         // ── size + token id ────────────────────────────────────────────────
-        let (size, dry_run, ttl_secs, state_arc) = {
+        let (size, dry_run, ttl_secs, state_arc, token_price_snap) = {
             let eng = engine.lock().await;
-            let balance = atomic_to_f64(
-                eng.state.balance_usdc.load(Ordering::Acquire) as u64
-            );
-            // Halt if balance fell below $1
+            let balance = atomic_to_f64(eng.state.balance_usdc.load(Ordering::Acquire));
             if balance < 1.0 {
                 tracing::error!("[ENGINE] Balance ${balance:.2} < $1 — EMERGENCY halt");
                 eng.state.bot_status.store(bot_status::EMERGENCY, Ordering::Release);
                 let _ = clob.cancel_all().await;
                 break;
             }
-            // Edge = spread component + lead-lag floor.
-            // Lead-lag floor (0.02): BTC moves ~50-200ms before Polymarket reprices,
-            // giving baseline alpha even when the token is near fair value.
-            // Spread component: how far below 0.5 the token is (extra mispricing).
-            // If the market has already repriced above 0.65 we consider our signal stale.
             let token_price = match direction {
                 Direction::Up =>
                     atomic_to_f64(eng.state.eth_up_price.load(Ordering::Acquire)),
                 Direction::Down =>
                     atomic_to_f64(eng.state.eth_down_price.load(Ordering::Acquire)),
             };
-            const LEAD_LAG_FLOOR: f64 = 0.02;
             const STALE_THRESHOLD: f64 = 0.65;
             let edge = if token_price > 0.0 && token_price < STALE_THRESHOLD {
-                let spread = if token_price < 0.5 { 0.5 - token_price } else { 0.0 };
-                spread + LEAD_LAG_FLOOR
+                let score_edge = (score.abs() - eng.config.score_threshold).max(0.0);
+                let token_mispricing = if token_price < 0.5 { 0.5 - token_price } else { 0.0 };
+                score_edge + token_mispricing
             } else {
-                0.0 // market fully repriced or no price available — skip
+                0.0
             };
-            tracing::debug!("[ENGINE] token_price={token_price:.4} edge={edge:.4}");
+            tracing::debug!(
+                "[ENGINE] token_price={token_price:.4} score={score:.3} edge={edge:.4}"
+            );
             let sz = eng.half_kelly_size(edge, balance);
-            (sz, eng.config.dry_run, eng.config.order_ttl_secs, eng.state.clone())
+            (sz, eng.config.dry_run, eng.config.order_ttl_secs, eng.state.clone(), token_price)
         };
 
         if size < 1.0 {
@@ -300,14 +341,20 @@ pub async fn run_engine_loop(
 
         if dry_run {
             tracing::info!(
-                "[ENGINE] DRY_RUN signal={:?} size=${size:.2} expiry={expiry}s",
+                "[ENGINE] DRY_RUN signal={:?} score={score:.3} size=${size:.2} expiry={expiry}s",
                 direction
             );
-            // Update momentum_decaying for TUI even in dry_run
-            let decaying = {
-                let eng = engine.lock().await;
-                eng.momentum.is_decaying()
-            };
+            record_trade(&state_arc, crate::state::TradeRecord {
+                closed_at:   Utc::now(),
+                side:        match direction {
+                    Direction::Up   => crate::state::OrderSide::Up,
+                    Direction::Down => crate::state::OrderSide::Down,
+                },
+                entry_price: token_price_snap,
+                qty:         size,
+                status:      crate::state::TradeStatus::Filled,
+            });
+            let decaying = { engine.lock().await.momentum.is_decaying() };
             state_arc.momentum_decaying.store(decaying as u8, Ordering::Release);
             continue;
         }
@@ -367,6 +414,12 @@ pub async fn run_engine_loop(
     }
 }
 
+fn record_trade(state: &AppState, record: crate::state::TradeRecord) {
+    let mut h = state.trade_history.lock().unwrap();
+    h.push_front(record);
+    h.truncate(50);
+}
+
 /// Cancel an order after TTL expires OR BTC trend flips — whichever comes first.
 async fn order_watchdog(
     order_id: String,
@@ -379,14 +432,31 @@ async fn order_watchdog(
         _ = tokio::time::sleep(Duration::from_secs(ttl_secs)) => {
             tracing::info!("[ENGINE] TTL expired — cancelling {order_id}");
             let _ = clob.cancel_order(&order_id).await;
-            state.orders.remove(&order_id);
+            if let Some((_, order)) = state.orders.remove(&order_id) {
+                record_trade(&state, crate::state::TradeRecord {
+                    closed_at:   Utc::now(),
+                    side:        order.side,
+                    entry_price: order.price,
+                    qty:         order.quantity,
+                    status:      crate::state::TradeStatus::Cancelled,
+                });
+            }
         }
         _ = wait_trend_change(&state, initial_trend) => {
             tracing::info!("[ENGINE] Trend flipped — cancelling {order_id}");
             let _ = clob.cancel_order(&order_id).await;
-            state.orders.remove(&order_id);
+            if let Some((_, order)) = state.orders.remove(&order_id) {
+                record_trade(&state, crate::state::TradeRecord {
+                    closed_at:   Utc::now(),
+                    side:        order.side,
+                    entry_price: order.price,
+                    qty:         order.quantity,
+                    status:      crate::state::TradeStatus::Cancelled,
+                });
+            }
         }
     }
+    state.bot_status.store(bot_status::HUNTING, Ordering::Release);
 }
 
 async fn wait_trend_change(state: &AppState, initial_trend: u8) {
@@ -564,44 +634,82 @@ mod tests {
     // ── compute_signal ────────────────────────────────────────────────────────
 
     #[test]
-    fn test_signal_bull_trend() {
+    fn test_signal_rising_btc_fires_up() {
         let mut eng = make_engine();
-        eng.state.btc.trend.store(trend::BULL, Ordering::Release);
-        eng.state.time_to_expiry_secs.store(120, Ordering::Release);
-        let sig = eng.compute_signal(1000, 65_000.0);
-        assert_eq!(sig, Some(Direction::Up));
+        eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+        // +$10/s velocity → btc_norm=1.0 → score=0.60 > threshold 0.15
+        eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+        let sig = eng.compute_signal(1000, 60_010.0, 0.0, 0.0);
+        assert!(matches!(sig, Some((Direction::Up, _))), "rising BTC should fire Up");
     }
 
     #[test]
-    fn test_signal_bear_trend() {
+    fn test_signal_falling_btc_fires_down() {
         let mut eng = make_engine();
-        eng.state.btc.trend.store(trend::BEAR, Ordering::Release);
-        eng.state.time_to_expiry_secs.store(120, Ordering::Release);
-        let sig = eng.compute_signal(1000, 65_000.0);
-        assert_eq!(sig, Some(Direction::Down));
+        eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+        eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+        let sig = eng.compute_signal(1000, 59_990.0, 0.0, 0.0);
+        assert!(matches!(sig, Some((Direction::Down, _))), "falling BTC should fire Down");
     }
 
     #[test]
-    fn test_signal_none_neutral_trend() {
+    fn test_signal_tiny_move_no_trade() {
         let mut eng = make_engine();
-        eng.state.btc.trend.store(trend::NEUTRAL, Ordering::Release);
-        eng.state.time_to_expiry_secs.store(120, Ordering::Release);
-        let sig = eng.compute_signal(1000, 65_000.0);
-        assert_eq!(sig, None);
+        eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+        // +$0.5/s → btc_norm=0.05 → score=0.03, below threshold 0.15
+        eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+        let sig = eng.compute_signal(1000, 60_000.5, 0.0, 0.0);
+        assert!(sig.is_none(), "tiny BTC move should not fire");
+    }
+
+    #[test]
+    fn test_signal_ptb_overrides_weak_btc() {
+        let mut eng = make_engine();
+        eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+        // BTC +$2/s → btc_norm=0.2 → alpha*btc=0.12
+        // ETH $2450 vs PTB $2500 → ptb_pct=-2.0% → ptb_norm=-1.0 → beta*ptb=-0.40
+        // score = 0.12 - 0.40 = -0.28 → Down
+        eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+        let sig = eng.compute_signal(1000, 60_002.0, 2450.0, 2500.0);
+        assert!(matches!(sig, Some((Direction::Down, _))),
+            "PTB displacement should flip weak Up-BTC to Down");
+    }
+
+    #[test]
+    fn test_signal_ptb_zero_uses_btc_only() {
+        let mut eng = make_engine();
+        eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+        // ptb=0 → ptb_norm=0; strong BTC still fires
+        eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+        let sig = eng.compute_signal(1000, 60_010.0, 2360.0, 0.0);
+        assert!(matches!(sig, Some((Direction::Up, _))),
+            "should fire on BTC alone when ptb=0");
+    }
+
+    #[test]
+    fn test_signal_score_returned_with_direction() {
+        let mut eng = make_engine();
+        eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+        eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+        let sig = eng.compute_signal(1000, 60_010.0, 0.0, 0.0);
+        if let Some((dir, score)) = sig {
+            assert_eq!(dir, Direction::Up);
+            assert!(score > 0.15, "score {score} should exceed threshold 0.15");
+        } else {
+            panic!("expected a signal");
+        }
     }
 
     #[test]
     fn test_signal_suppressed_near_expiry_decaying() {
         let mut eng = make_engine();
-        eng.state.btc.trend.store(trend::BULL, Ordering::Release);
-        eng.state.time_to_expiry_secs.store(60, Ordering::Release); // < 90s guard
-
-        // Feed decaying momentum
-        eng.compute_signal(0,    100.0);
-        eng.compute_signal(1000, 102.0);
-        eng.compute_signal(2000, 103.5);
-        eng.compute_signal(3000, 104.5);
-        let sig = eng.compute_signal(4000, 105.0); // now decaying
-        assert_eq!(sig, None, "signal should be suppressed near expiry with decaying momentum");
+        eng.state.time_to_expiry_secs.store(60, Ordering::Release);
+        // Feed decaying momentum (copied from old test, updated signature)
+        eng.compute_signal(0,    100.0, 0.0, 0.0);
+        eng.compute_signal(1000, 102.0, 0.0, 0.0);
+        eng.compute_signal(2000, 103.5, 0.0, 0.0);
+        eng.compute_signal(3000, 104.5, 0.0, 0.0);
+        let sig = eng.compute_signal(4000, 105.0, 0.0, 0.0);
+        assert!(sig.is_none(), "signal should be suppressed near expiry with decaying momentum");
     }
 }

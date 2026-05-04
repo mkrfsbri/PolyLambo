@@ -1,6 +1,6 @@
 use eth5m_bot::config::Config;
 use eth5m_bot::engine::{Direction, EntryContext, MomentumWindow, ReversalStatus, TradingEngine};
-use eth5m_bot::state::{trend, AppState};
+use eth5m_bot::state::AppState;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,17 +77,50 @@ fn kelly_capped_at_10_pct() {
 // ── compute_signal ────────────────────────────────────────────────────────────
 
 #[test]
-fn signal_bull_returns_up() {
+fn signal_rising_btc_fires_up() {
     let mut eng = make_engine();
-    eng.state.btc.trend.store(trend::BULL, Ordering::Release);
     eng.state.time_to_expiry_secs.store(200, Ordering::Release);
-    assert_eq!(eng.compute_signal(1000, 65_000.0), Some(Direction::Up));
+    // +$10/s velocity → btc_norm=1.0 → score=0.60 > threshold 0.15
+    eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+    let sig = eng.compute_signal(1000, 60_010.0, 0.0, 0.0);
+    assert!(matches!(sig, Some((Direction::Up, _))), "rising BTC should fire Up");
 }
 
 #[test]
-fn signal_bear_returns_down() {
+fn signal_falling_btc_fires_down() {
     let mut eng = make_engine();
-    eng.state.btc.trend.store(trend::BEAR, Ordering::Release);
     eng.state.time_to_expiry_secs.store(200, Ordering::Release);
-    assert_eq!(eng.compute_signal(1000, 65_000.0), Some(Direction::Down));
+    eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+    let sig = eng.compute_signal(1000, 59_990.0, 0.0, 0.0);
+    assert!(matches!(sig, Some((Direction::Down, _))), "falling BTC should fire Down");
+}
+
+#[test]
+fn signal_tiny_move_no_trade() {
+    let mut eng = make_engine();
+    eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+    eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+    let sig = eng.compute_signal(1000, 60_000.5, 0.0, 0.0);
+    assert!(sig.is_none(), "tiny BTC move should not fire");
+}
+
+#[test]
+fn signal_ptb_overrides_weak_btc() {
+    let mut eng = make_engine();
+    eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+    // BTC +$2/s → score contribution from BTC = 0.12; ETH $2450 vs PTB $2500 → -0.40; net = -0.28 → Down
+    eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+    let sig = eng.compute_signal(1000, 60_002.0, 2450.0, 2500.0);
+    assert!(matches!(sig, Some((Direction::Down, _))),
+        "PTB displacement should flip weak Up-BTC to Down");
+}
+
+#[test]
+fn signal_ptb_zero_uses_btc_only() {
+    let mut eng = make_engine();
+    eng.state.time_to_expiry_secs.store(200, Ordering::Release);
+    eng.compute_signal(0, 60_000.0, 0.0, 0.0);
+    let sig = eng.compute_signal(1000, 60_010.0, 2360.0, 0.0);
+    assert!(matches!(sig, Some((Direction::Up, _))),
+        "should fire on BTC alone when ptb=0");
 }
