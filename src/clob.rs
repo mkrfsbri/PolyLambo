@@ -110,7 +110,7 @@ impl ClobClient {
         tracing::info!(
             "[CLOB] Order placed | ID: {order_id} | Side: {side_str} \
              | Price: {price:.2} | Size: ${size_usdc:.0} | Lat: {}ms",
-            t0.elapsed().as_millis()
+            lat_us / 1000
         );
         if lat_us > SIGNAL_BUDGET_US {
             tracing::warn!(

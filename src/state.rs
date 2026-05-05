@@ -80,7 +80,8 @@ pub struct ActiveOrder {
     pub order_id: String,
     pub side: OrderSide,
     pub price: f64,
-    pub quantity: f64,
+    /// USDC notional spent on this order
+    pub size_usdc: f64,
     pub placed_at: Instant,
     pub status: OrderStatus,
 }
@@ -96,7 +97,8 @@ pub struct TradeRecord {
     pub closed_at:   chrono::DateTime<chrono::Utc>,
     pub side:        OrderSide,
     pub entry_price: f64,
-    pub qty:         f64,
+    /// Shares (tokens) held — size_usdc / entry_price
+    pub qty_shares:  f64,
     pub status:      TradeStatus,
 }
 
@@ -272,7 +274,7 @@ mod tests {
             order_id: "abc123".to_string(),
             side: OrderSide::Up,
             price: 0.62,
-            quantity: 15.0,
+            size_usdc: 15.0,
             placed_at: Instant::now(),
             status: OrderStatus::Pending,
         };
@@ -291,7 +293,7 @@ mod tests {
                 closed_at: chrono::Utc::now(),
                 side: OrderSide::Up,
                 entry_price: 0.52,
-                qty: 10.0,
+                qty_shares: 10.0 / 0.52,
                 status: TradeStatus::Filled,
             });
             h.truncate(50);
@@ -309,14 +311,14 @@ mod tests {
                 closed_at: chrono::Utc::now(),
                 side: OrderSide::Up,
                 entry_price: 0.50,
-                qty: 5.0,
+                qty_shares: 5.0 / 0.50,
                 status: TradeStatus::Cancelled,
             });
             h.push_front(TradeRecord {
                 closed_at: chrono::Utc::now(),
                 side: OrderSide::Down,
                 entry_price: 0.48,
-                qty: 8.0,
+                qty_shares: 8.0 / 0.48,
                 status: TradeStatus::Filled,
             });
         }
@@ -341,7 +343,7 @@ mod tests {
             order_id: "order-1".to_string(),
             side: OrderSide::Down,
             price: 0.38,
-            quantity: 10.0,
+            size_usdc: 10.0,
             placed_at: Instant::now(),
             status: OrderStatus::Pending,
         };

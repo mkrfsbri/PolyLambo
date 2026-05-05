@@ -4,31 +4,33 @@ use eth5m_bot::gamma::{slug_for_ts, expiry_secs_for_ts};
 
 #[test]
 fn slug_generation() {
-    // Plan spec: ts 1746000000 → "eth-updown-5m-1746000300"
-    assert_eq!(slug_for_ts(1_746_000_000), "eth-updown-5m-1746000300");
+    // Slugs use window OPEN time: ts 1746000000 is exactly the open → slug ends in 1746000000
+    assert_eq!(slug_for_ts(1_746_000_000), "eth-updown-5m-1746000000");
 }
 
 #[test]
 fn slug_boundary_edge() {
-    // Exactly on a 300s boundary → must predict the NEXT window, not current
-    assert_eq!(slug_for_ts(1_746_000_000), "eth-updown-5m-1746000300");
-    assert_eq!(slug_for_ts(1_746_000_300), "eth-updown-5m-1746000600");
+    // Exactly on a 300s boundary → the new window just opened at that timestamp
+    assert_eq!(slug_for_ts(1_746_000_000), "eth-updown-5m-1746000000");
+    assert_eq!(slug_for_ts(1_746_000_300), "eth-updown-5m-1746000300");
 }
 
 #[test]
 fn slug_mid_window() {
-    // 150s into a window still produces the same next boundary
-    assert_eq!(slug_for_ts(1_746_000_150), "eth-updown-5m-1746000300");
+    // 150s into the window that opened at 1746000000
+    assert_eq!(slug_for_ts(1_746_000_150), "eth-updown-5m-1746000000");
 }
 
 #[test]
 fn slug_one_before_boundary() {
-    assert_eq!(slug_for_ts(1_746_000_299), "eth-updown-5m-1746000300");
+    // 1s before next boundary → still in the 1746000000 window
+    assert_eq!(slug_for_ts(1_746_000_299), "eth-updown-5m-1746000000");
 }
 
 #[test]
 fn slug_one_after_boundary() {
-    assert_eq!(slug_for_ts(1_746_000_301), "eth-updown-5m-1746000600");
+    // 1s past the 1746000300 boundary → now in the 1746000300 window
+    assert_eq!(slug_for_ts(1_746_000_301), "eth-updown-5m-1746000300");
 }
 
 #[test]

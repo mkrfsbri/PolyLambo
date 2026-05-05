@@ -239,7 +239,7 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
                 order_id: o.order_id.clone(),
                 side: match o.side { state::OrderSide::Up => "UP", state::OrderSide::Down => "DOWN" }.to_string(),
                 price: o.price,
-                qty: o.quantity,
+                qty: o.size_usdc,
                 status: format!("{:?}", o.status),
                 ttl_secs: u64::MAX,
             }
@@ -266,7 +266,7 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
                     OrderSide::Down => "DN".to_string(),
                 },
                 price:  r.entry_price,
-                qty:    r.qty,
+                qty:    r.qty_shares,
                 status: match r.status {
                     TradeStatus::Filled    => "Filled".to_string(),
                     TradeStatus::Cancelled => "Cancelled".to_string(),
@@ -283,11 +283,8 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
                         state::atomic_to_f64(state.eth_down_price.load(Ordering::Acquire)),
                 };
                 let elapsed_secs = o.placed_at.elapsed().as_secs();
-                let unrealized_pnl = if o.price > 0.0 {
-                    (current_price - o.price) / o.price * o.quantity
-                } else {
-                    0.0
-                };
+                let qty_shares = if o.price > 0.0 { o.size_usdc / o.price } else { 0.0 };
+                let unrealized_pnl = qty_shares * (current_price - o.price);
                 tui::PositionSnap {
                     side: match o.side {
                         state::OrderSide::Up   => "UP".to_string(),
@@ -295,7 +292,7 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
                     },
                     entry_price: o.price,
                     current_price,
-                    qty: o.quantity,
+                    qty: qty_shares,
                     elapsed_secs,
                     unrealized_pnl,
                 }

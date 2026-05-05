@@ -205,7 +205,7 @@ fn render_market(frame: &mut Frame, area: Rect, snap: &TuiSnapshot) {
 }
 
 fn render_orders(frame: &mut Frame, area: Rect, orders: &[OrderSnap]) {
-    let header = Row::new(["ID (trunc)", "Side", "Price", "Qty", "Status", "TTL"])
+    let header = Row::new(["ID (trunc)", "Side", "Price", "USDC", "Status", "TTL"])
         .style(Style::default().bold().fg(Color::Yellow));
 
     let rows: Vec<Row> = orders.iter().map(|o| {
@@ -274,7 +274,7 @@ fn render_position(frame: &mut Frame, area: Rect, pos: Option<&PositionSnap>) {
                 Style::default().fg(cur_color).bold(),
             ),
             Span::styled(cur_arrow, Style::default().fg(cur_color)),
-            Span::raw(format!("  Size: ${:.2}", p.qty)),
+            Span::raw(format!("  Qty: {:.2} shr", p.qty)),
         ]),
         Line::from(vec![
             Span::raw(format!("  Elapsed: {}s   Est. P&L: ", p.elapsed_secs)),
@@ -288,7 +288,7 @@ fn render_position(frame: &mut Frame, area: Rect, pos: Option<&PositionSnap>) {
 }
 
 fn render_history(frame: &mut Frame, area: Rect, history: &[TradeSnap]) {
-    let header = Row::new(["Time", "Side", "Price", "Qty", "Status"])
+    let header = Row::new(["Time", "Side", "Price", "Qty(shr)", "Status"])
         .style(Style::default().bold().fg(Color::Yellow));
 
     let rows: Vec<Row> = if history.is_empty() {

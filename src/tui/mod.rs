@@ -88,7 +88,7 @@ pub struct TradeSnap {
     pub time:   String,   // "HH:MM:SS"
     pub side:   String,   // "UP" | "DN"
     pub price:  f64,
-    pub qty:    f64,
+    pub qty:    f64,      // shares (tokens held)
     pub status: String,   // "Filled" | "Cancelled"
 }
 
@@ -97,9 +97,9 @@ pub struct PositionSnap {
     pub side:           String,  // "UP" | "DN"
     pub entry_price:    f64,     // token entry price (0–1)
     pub current_price:  f64,     // current token mid price (0–1)
-    pub qty:            f64,     // USDC notional
+    pub qty:            f64,     // shares (tokens held = size_usdc / entry_price)
     pub elapsed_secs:   u64,
-    pub unrealized_pnl: f64,     // rough (current-entry)/entry * qty
+    pub unrealized_pnl: f64,     // qty_shares * (current_price - entry_price)
 }
 
 // ── TUI entry point ───────────────────────────────────────────────────────────

@@ -366,7 +366,7 @@ pub async fn run_engine_loop(
                     Direction::Down => OrderSide::Down,
                 },
                 price:     token_price_snap,
-                quantity:  size,
+                size_usdc: size,
                 placed_at: Instant::now(),
                 status:    crate::state::OrderStatus::Filled,
             });
@@ -383,6 +383,7 @@ pub async fn run_engine_loop(
                 "[ENGINE] DRY_RUN signal={:?} score={score:.3} size=${size:.2} expiry={expiry}s",
                 direction
             );
+            let qty_shares_entry = if token_price_snap > 0.0 { size / token_price_snap } else { 0.0 };
             record_trade(&state_arc, crate::state::TradeRecord {
                 closed_at:   Utc::now(),
                 side:        match direction {
@@ -390,7 +391,7 @@ pub async fn run_engine_loop(
                     Direction::Down => crate::state::OrderSide::Down,
                 },
                 entry_price: token_price_snap,
-                qty:         size,
+                qty_shares:  qty_shares_entry,
                 status:      crate::state::TradeStatus::Filled,
             });
 
@@ -491,7 +492,7 @@ pub async fn run_engine_loop(
             order_id: order_id.clone(),
             side:     order_side.clone(),
             price,
-            quantity: size,
+            size_usdc: size,
             placed_at: Instant::now(),
             status:   crate::state::OrderStatus::Pending,
         });
@@ -534,11 +535,12 @@ async fn order_watchdog(
             tracing::info!("[ENGINE] TTL expired — cancelling {order_id}");
             let _ = clob.cancel_order(&order_id).await;
             if let Some((_, order)) = state.orders.remove(&order_id) {
+                let shares = if order.price > 0.0 { order.size_usdc / order.price } else { 0.0 };
                 record_trade(&state, crate::state::TradeRecord {
                     closed_at:   Utc::now(),
                     side:        order.side,
                     entry_price: order.price,
-                    qty:         order.quantity,
+                    qty_shares:  shares,
                     status:      crate::state::TradeStatus::Cancelled,
                 });
             }
@@ -547,11 +549,12 @@ async fn order_watchdog(
             tracing::info!("[ENGINE] Trend flipped — cancelling {order_id}");
             let _ = clob.cancel_order(&order_id).await;
             if let Some((_, order)) = state.orders.remove(&order_id) {
+                let shares = if order.price > 0.0 { order.size_usdc / order.price } else { 0.0 };
                 record_trade(&state, crate::state::TradeRecord {
                     closed_at:   Utc::now(),
                     side:        order.side,
                     entry_price: order.price,
-                    qty:         order.quantity,
+                    qty_shares:  shares,
                     status:      crate::state::TradeStatus::Cancelled,
                 });
             }

@@ -9,16 +9,17 @@ use std::time::Duration;
 use crate::state::{AppState, f64_to_atomic};
 
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
+const POLY_BASE:  &str = "https://polymarket.com";
 const POLL_INTERVAL_SECS: u64 = 10;
 const WINDOW_SECS: u64 = 300;
 
 // ── slug algorithm ────────────────────────────────────────────────────────────
 
-/// Compute the next 5-minute window slug.
+/// Compute the slug for the currently active 5-minute window.
 ///
-/// Always rounds to the STRICTLY NEXT multiple of 300s — even when `now` is
-/// exactly on a boundary (market has just expired → predict the next one).
-pub fn compute_next_slug() -> String {
+/// Polymarket slugs are named by the window OPEN time (floor of 300s boundary),
+/// e.g. "eth-updown-5m-1746000000" opens at T=1746000000 and resolves at T+300.
+pub fn compute_current_slug() -> String {
     let ts = Utc::now().timestamp() as u64;
     slug_for_ts(ts)
 }
@@ -26,8 +27,8 @@ pub fn compute_next_slug() -> String {
 /// Pure function — compute slug for an arbitrary unix timestamp.
 /// Separated for deterministic unit-testing.
 pub fn slug_for_ts(ts: u64) -> String {
-    let next = ((ts / WINDOW_SECS) + 1) * WINDOW_SECS;
-    format!("eth-updown-5m-{next}")
+    let open = (ts / WINDOW_SECS) * WINDOW_SECS;
+    format!("eth-updown-5m-{open}")
 }
 
 /// Seconds remaining until the next 300s boundary from an arbitrary timestamp.
@@ -164,6 +165,33 @@ pub async fn fetch_market_tokens(slug: &str, client: &Client) -> Result<MarketTo
     })
 }
 
+/// Fetch the authoritative "price to beat" from Polymarket's equity API.
+///
+/// This is the ETH/USD Chainlink price that was captured at the exact window-open
+/// moment. It is what Polymarket uses for final resolution — not a live price.
+/// Returns an error when the slug is not yet active or the API is unreachable.
+pub async fn fetch_price_to_beat(slug: &str, client: &Client) -> Result<f64> {
+    let url = format!("{POLY_BASE}/api/equity/price-to-beat/{slug}");
+    let v: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .context("price-to-beat HTTP")?
+        .json()
+        .await
+        .context("price-to-beat JSON")?;
+
+    // Handle several plausible response shapes
+    let price = v["price"].as_f64()
+        .or_else(|| v["priceToBeat"].as_f64())
+        .or_else(|| v["value"].as_f64())
+        .or_else(|| v["data"].as_f64())
+        .or_else(|| v.as_f64())
+        .filter(|&p| (500.0..=100_000.0).contains(&p));
+
+    price.ok_or_else(|| anyhow::anyhow!("price-to-beat: unexpected response body: {v}"))
+}
+
 // ── CLOB orderbook refresh ────────────────────────────────────────────────────
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
@@ -193,8 +221,13 @@ async fn fetch_clob_book_top(token_id: &str, client: &Client) -> (Option<f64>, O
         Ok(b) => b,
         Err(_) => return (None, None),
     };
-    let best_bid = book.bids.first().and_then(|l| l.price.parse().ok());
-    let best_ask = book.asks.first().and_then(|l| l.price.parse().ok());
+    // Compute best bid (max) and best ask (min) without relying on sort order.
+    let best_bid = book.bids.iter()
+        .filter_map(|l| l.price.parse::<f64>().ok())
+        .reduce(f64::max);
+    let best_ask = book.asks.iter()
+        .filter_map(|l| l.price.parse::<f64>().ok())
+        .reduce(f64::min);
     (best_bid, best_ask)
 }
 
@@ -242,7 +275,7 @@ pub async fn refresh_prices_from_clob(state: &AppState, client: &Client) {
 
 // ── discovery loop ────────────────────────────────────────────────────────────
 
-/// Apply UP/DOWN token prices from a fetched result to shared state.
+/// Apply UP/DOWN token prices to shared state.
 fn apply_poly_prices(state: &AppState, tokens: &MarketTokens) {
     if let Some(p) = tokens.up_price {
         let prev = state.eth_up_price.load(Ordering::Acquire);
@@ -256,19 +289,43 @@ fn apply_poly_prices(state: &AppState, tokens: &MarketTokens) {
     }
 }
 
+/// Try to fetch and store eth_open_price (price-to-beat) from the equity API.
+/// Primary source: `GET /api/equity/price-to-beat/{slug}`.
+/// Fallback: description-parsed reference_price from the Gamma market object.
+/// Returns true when a price was successfully stored.
+async fn try_set_open_price(
+    state: &AppState,
+    slug: &str,
+    client: &Client,
+    fallback: Option<f64>,
+) -> bool {
+    match fetch_price_to_beat(slug, client).await {
+        Ok(p) => {
+            state.eth_open_price.store(f64_to_atomic(p), Ordering::Release);
+            tracing::info!("[GAMMA] price-to-beat: ${p:.2} (equity API)");
+            return true;
+        }
+        Err(e) => tracing::debug!("[GAMMA] price-to-beat API: {e:#}"),
+    }
+    // Fallback: description-parsed price from Gamma market
+    if let Some(p) = fallback.filter(|&p| p > 0.0) {
+        state.eth_open_price.store(f64_to_atomic(p), Ordering::Release);
+        tracing::info!("[GAMMA] price-to-beat: ${p:.2} (description fallback)");
+        return true;
+    }
+    false
+}
+
 /// Long-running task: polls every 10s.
 ///
 /// - Updates slug + token IDs + question only when the window changes.
+/// - On window change, fetches price-to-beat from `/api/equity/price-to-beat/{slug}`.
 /// - Always refreshes UP/DOWN token prices so the TUI stays live.
 /// - When the window changes but the new slug isn't live yet, refreshes prices
 ///   from the old slug so POLY prices don't go stale during the transition.
-/// - Sets eth_open_price ("price to beat") from the Polymarket-recorded
-///   closing price of the just-finished window (its description after
-///   settlement); falls back to the new window's description, then live
-///   Binance spot.
 pub async fn discover_and_update(state: Arc<AppState>, client: Client) {
     loop {
-        let slug = compute_next_slug();
+        let slug = compute_current_slug();
         let ts = Utc::now().timestamp() as u64;
         let current = state.current_slug.read().await.clone();
         let slug_changed = slug != current;
@@ -277,33 +334,16 @@ pub async fn discover_and_update(state: Arc<AppState>, client: Client) {
             // New window: try the upcoming slug, fall back to old slug for prices.
             match fetch_market_tokens(&slug, &client).await {
                 Ok(tokens) => {
-                    tracing::info!(
-                        "[GAMMA] New window: {slug} | q: {} | ref_price: {:?}",
-                        tokens.question,
-                        tokens.reference_price,
-                    );
+                    tracing::info!("[GAMMA] New window: {slug} | q: {}", tokens.question);
                     *state.current_slug.write().await = slug.clone();
                     *state.up_token_id.write().await = tokens.up_token_id.clone();
                     *state.down_token_id.write().await = tokens.down_token_id.clone();
                     *state.current_question.write().await = tokens.question.clone();
 
-                    // Price-to-beat: prefer Polymarket's own reference price
-                    // recorded in the market description (most authoritative).
-                    // The boundary timer in poly_ws handles the Binance-spot
-                    // fallback at the exact 300-second window boundary, so we
-                    // do NOT fall back to live Binance spot here — that would
-                    // capture the price up to 10 s after window open.
-                    let prev_ref = if !current.is_empty() {
-                        fetch_market_tokens(&current, &client).await
-                            .ok()
-                            .and_then(|t| t.reference_price)
-                    } else {
-                        None
-                    };
-                    if let Some(open) = prev_ref.or(tokens.reference_price).filter(|&p| p > 0.0) {
-                        state.eth_open_price.store(f64_to_atomic(open), Ordering::Release);
-                        tracing::info!("[GAMMA] price-to-beat from description: ${open:.2}");
-                    }
+                    // Authoritative price-to-beat for this window.
+                    // The boundary timer may have already seeded a Chainlink/Binance
+                    // approximation; overwrite it with the exact API value.
+                    try_set_open_price(&state, &slug, &client, tokens.reference_price).await;
 
                     apply_poly_prices(&state, &tokens);
                 }
@@ -319,9 +359,15 @@ pub async fn discover_and_update(state: Arc<AppState>, client: Client) {
                 }
             }
         } else if !current.is_empty() {
-            // Same window: refresh prices only.
             match fetch_market_tokens(&current, &client).await {
-                Ok(tokens) => apply_poly_prices(&state, &tokens),
+                Ok(tokens) => {
+                    // Retry price-to-beat if the boundary timer hasn't set it yet
+                    // (API may not respond immediately at t=0 of a new window).
+                    if state.eth_open_price.load(Ordering::Acquire) == 0 {
+                        try_set_open_price(&state, &current, &client, tokens.reference_price).await;
+                    }
+                    apply_poly_prices(&state, &tokens);
+                }
                 Err(e) => tracing::warn!("[GAMMA] Price refresh failed: {e:#}"),
             }
         }
@@ -343,30 +389,30 @@ mod tests {
 
     #[test]
     fn test_slug_generation_mid_window() {
-        // 1746000150 is 150s into a window (1746000000..1746000300)
+        // 1746000150 is 150s into the window that OPENS at 1746000000
         let slug = slug_for_ts(1_746_000_150);
-        assert_eq!(slug, "eth-updown-5m-1746000300");
+        assert_eq!(slug, "eth-updown-5m-1746000000");
     }
 
     #[test]
     fn test_slug_generation_near_boundary() {
-        // 1746000299 is 1s before boundary
+        // 1746000299 is 1s before the next boundary, still in the 1746000000 window
         let slug = slug_for_ts(1_746_000_299);
-        assert_eq!(slug, "eth-updown-5m-1746000300");
+        assert_eq!(slug, "eth-updown-5m-1746000000");
     }
 
     #[test]
     fn test_slug_boundary_edge() {
-        // Exactly on a 300s boundary → must predict the NEXT window, not current
+        // Exactly on a 300s boundary → the NEW window has just opened at that timestamp
         let slug = slug_for_ts(1_746_000_000);
-        assert_eq!(slug, "eth-updown-5m-1746000300");
+        assert_eq!(slug, "eth-updown-5m-1746000000");
     }
 
     #[test]
     fn test_slug_boundary_plus_one() {
-        // 1 second past a boundary → next boundary is 299s away
+        // 1 second past a boundary → still in the window that opened at 1746000300
         let slug = slug_for_ts(1_746_000_301);
-        assert_eq!(slug, "eth-updown-5m-1746000600");
+        assert_eq!(slug, "eth-updown-5m-1746000300");
     }
 
     #[test]

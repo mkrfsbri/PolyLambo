@@ -203,67 +203,107 @@ async fn rtds_session(state: &Arc<AppState>) -> Result<()> {
     let (mut ws, _) = connect_async(RTDS_WS).await?;
     tracing::info!("[RTDS_WS] connected");
 
-    while let Some(raw) = ws.next().await {
-        match raw? {
-            Message::Text(text) => {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-                on_rtds_msg(state, &v);
+    // Subscribe to Chainlink ETH/USD — Polymarket's oracle for ETH resolution
+    let sub = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": "{\"symbol\":\"eth/usd\"}"
+        }]
+    });
+    ws.send(Message::Text(sub.to_string())).await?;
+
+    let mut ping_tick = tokio::time::interval(Duration::from_secs(5));
+    ping_tick.tick().await; // consume immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = ping_tick.tick() => {
+                ws.send(Message::Text("PING".to_string())).await?;
             }
-            Message::Close(_) => break,
-            Message::Ping(d)  => { let _ = ws.send(Message::Pong(d)).await; }
-            _ => {}
+            raw = ws.next() => {
+                let Some(msg) = raw else { break };
+                match msg? {
+                    Message::Text(text) => {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+                        on_rtds_msg(state, &v);
+                    }
+                    Message::Close(_) => break,
+                    Message::Ping(d)  => { let _ = ws.send(Message::Pong(d)).await; }
+                    _ => {}
+                }
+            }
         }
     }
     bail!("RTDS WS closed")
 }
 
-/// RTDS sends various event types.  We look for any numeric price in the known
-/// ETH/USD range (500–10 000) and use it as Polymarket's live spot price.
-/// UP/DOWN token prices are always 0–1 so there is no ambiguity.
+/// Processes a single RTDS message.
+/// Expects Chainlink ETH/USD messages: {topic, payload: {symbol, value, timestamp}}.
 fn on_rtds_msg(state: &AppState, v: &serde_json::Value) {
-    // Try several field names used across different RTDS message types
-    let price = v["price"].as_f64()
-        .or_else(|| v["data"]["price"].as_f64())
-        .or_else(|| v["open_price"].as_f64())
-        .or_else(|| v["opening_price"].as_f64())
-        .or_else(|| v["reference_price"].as_f64());
+    let topic = v["topic"].as_str().unwrap_or("");
+    if topic != "crypto_prices_chainlink" { return }
 
-    let Some(p) = price else { return };
-    if p < 500.0 || p > 10_000.0 { return }
+    let Some(p) = v["payload"]["value"].as_f64() else { return };
+    if !(500.0..=10_000.0).contains(&p) { return }
 
-    // Always update Polymarket live ETH spot price (shown as "POLY ETH" in TUI)
+    // Chainlink ETH/USD = Polymarket's live oracle price (shown as "POLY ETH" in TUI).
+    // Note: this is the CURRENT price, not the window-open price-to-beat.
+    // eth_open_price is set exclusively by run_open_price_boundary via the equity API.
     let prev = state.eth_poly_spot.load(Ordering::Acquire);
     state.eth_poly_spot_prev.store(prev, Ordering::Release);
     state.eth_poly_spot.store(f64_to_atomic(p), Ordering::Release);
-    tracing::trace!("[RTDS_WS] poly_eth: ${p:.2}");
-
-    // Update price-to-beat only in the first 30s of each 5-min window so we
-    // don't accidentally overwrite the correct opening price mid-window.
-    let ts = chrono::Utc::now().timestamp() as u64;
-    if ts % 300 < 30 {
-        state.eth_open_price.store(f64_to_atomic(p), Ordering::Release);
-        tracing::info!("[RTDS_WS] price-to-beat: ${p:.2}");
-    }
+    tracing::trace!("[RTDS_WS] Chainlink ETH: ${p:.2}");
 }
 
 // ── Boundary timer ────────────────────────────────────────────────────────────
 
-/// Sleeps until each 300-second UTC boundary, then snapshots the live Binance
-/// ETH spot price as eth_open_price ("price to beat").
+/// Fires at each 300-second UTC boundary and fetches the authoritative
+/// price-to-beat from `GET /api/equity/price-to-beat/{slug}`.
 ///
-/// This fires at the EXACT window-open moment, giving a much more accurate
-/// reference than the previous approach of reading the price inside a 10-second
-/// polling loop.  The RTDS WS may override this with Polymarket's oracle price.
+/// Seeds eth_open_price immediately with Chainlink (or Binance) so the TUI
+/// has a value from t=0, then retries the equity API up to 6 times (every 3 s)
+/// until Polymarket's backend has the exact window-open price available.
+/// discover_and_update also tries the API on slug change, so any success from
+/// either source wins.
 pub async fn run_open_price_boundary(state: Arc<AppState>) {
+    let client = reqwest::Client::new();
     loop {
         let ts = chrono::Utc::now().timestamp() as u64;
         let next_boundary = ((ts / 300) + 1) * 300;
         tokio::time::sleep(Duration::from_secs(next_boundary - ts)).await;
 
-        let price = atomic_to_f64(state.eth_spot_raw.load(Ordering::Acquire));
-        if price > 0.0 {
-            state.eth_open_price.store(f64_to_atomic(price), Ordering::Release);
-            tracing::info!("[BOUNDARY] price-to-beat: ${price:.2} (Binance at 5m boundary)");
+        let slug = crate::gamma::compute_current_slug();
+
+        // Immediate seed: Chainlink live price (or Binance fallback).
+        // This gives the TUI a value instantly; the API loop below overwrites it.
+        let poly_price = atomic_to_f64(state.eth_poly_spot.load(Ordering::Acquire));
+        let seed = if poly_price > 0.0 {
+            poly_price
+        } else {
+            atomic_to_f64(state.eth_spot_raw.load(Ordering::Acquire))
+        };
+        if seed > 0.0 {
+            state.eth_open_price.store(f64_to_atomic(seed), Ordering::Release);
+            tracing::info!("[BOUNDARY] price-to-beat seed: ${seed:.2} (Chainlink/Binance)");
+        }
+
+        // Retry equity API until Polymarket has the exact window-open price ready.
+        for attempt in 1u32..=6 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            match crate::gamma::fetch_price_to_beat(&slug, &client).await {
+                Ok(p) => {
+                    state.eth_open_price.store(f64_to_atomic(p), Ordering::Release);
+                    tracing::info!(
+                        "[BOUNDARY] price-to-beat: ${p:.2} (equity API, attempt {attempt})"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("[BOUNDARY] price-to-beat attempt {attempt}/6: {e:#}");
+                }
+            }
         }
     }
 }
