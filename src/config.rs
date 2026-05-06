@@ -19,6 +19,10 @@ pub struct Config {
     pub v_scale: f64,
     pub ptb_scale: f64,
     pub score_threshold: f64,
+    pub signal_confirm_ticks: u8,
+    pub take_profit_pct: f64,
+    pub stop_loss_pct: f64,
+    pub db_path: String,
 }
 
 impl Config {
@@ -60,6 +64,14 @@ impl Config {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(2.0),
             score_threshold: env::var("SCORE_THRESHOLD")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0.15),
+            signal_confirm_ticks: env::var("SIGNAL_CONFIRM_TICKS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            take_profit_pct: env::var("TAKE_PROFIT_PCT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(8.0),
+            stop_loss_pct: env::var("STOP_LOSS_PCT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(5.0),
+            db_path: env::var("DB_PATH")
+                .unwrap_or_else(|_| "./trades.db".to_string()),
         })
     }
 }
@@ -98,5 +110,37 @@ mod tests {
         assert!((cfg.score_threshold - 0.20).abs() < 1e-9);
         std::env::remove_var("ALPHA");
         std::env::remove_var("SCORE_THRESHOLD");
+    }
+
+    #[test]
+    fn test_new_param_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SIGNAL_CONFIRM_TICKS");
+        std::env::remove_var("TAKE_PROFIT_PCT");
+        std::env::remove_var("STOP_LOSS_PCT");
+        std::env::remove_var("DB_PATH");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.signal_confirm_ticks, 3);
+        assert!((cfg.take_profit_pct - 8.0).abs() < 1e-9);
+        assert!((cfg.stop_loss_pct - 5.0).abs() < 1e-9);
+        assert_eq!(cfg.db_path, "./trades.db");
+    }
+
+    #[test]
+    fn test_new_params_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SIGNAL_CONFIRM_TICKS", "5");
+        std::env::set_var("TAKE_PROFIT_PCT", "12.0");
+        std::env::set_var("STOP_LOSS_PCT", "3.5");
+        std::env::set_var("DB_PATH", "/tmp/test.db");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.signal_confirm_ticks, 5);
+        assert!((cfg.take_profit_pct - 12.0).abs() < 1e-9);
+        assert!((cfg.stop_loss_pct - 3.5).abs() < 1e-9);
+        assert_eq!(cfg.db_path, "/tmp/test.db");
+        std::env::remove_var("SIGNAL_CONFIRM_TICKS");
+        std::env::remove_var("TAKE_PROFIT_PCT");
+        std::env::remove_var("STOP_LOSS_PCT");
+        std::env::remove_var("DB_PATH");
     }
 }
