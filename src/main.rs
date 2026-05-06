@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use eth5m_bot::{binance, clob, config, engine, gamma, poly_ws, state, tui};
+use eth5m_bot::{binance, clob, config, db, engine, gamma, poly_ws, state, tui};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{watch, Mutex};
@@ -37,6 +37,14 @@ async fn main() -> Result<()> {
             cfg.polymarket_proxy_address.clone(),
         )?
     };
+
+    // ── trade database ────────────────────────────────────────────────────────
+    let db = Arc::new(
+        db::Db::open(&cfg.db_path)
+            .await
+            .context("failed to open trades.db")?,
+    );
+    tracing::info!("[PREFLIGHT] Trade DB open: {}", cfg.db_path);
 
     // ── pre-flight ────────────────────────────────────────────────────────────
     if cfg.dry_run {
@@ -132,7 +140,8 @@ async fn main() -> Result<()> {
     )));
     let clob_e = clob.clone();
     let te = trading_engine.clone();
-    let engine_task = tokio::spawn(async move { engine::run_engine_loop(te, clob_e).await });
+    let db_e = db.clone();
+    let engine_task = tokio::spawn(async move { engine::run_engine_loop(te, clob_e, db_e).await });
 
     // ── TUI watch channel + thread ────────────────────────────────────────────
     let (tui_tx, tui_rx) = watch::channel(tui::TuiSnapshot::default());
