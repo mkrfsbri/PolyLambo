@@ -319,17 +319,31 @@ pub async fn run_engine_loop(
             let mut eng = engine.lock().await;
             eng.compute_signal(ts_ms, btc_price, eth_live, ptb)
         };
-        let (direction, score) = match signal_result {
-            Some(pair) => pair,
-            None => {
-                engine.lock().await.state.signal_score.store(0, Ordering::Release);
-                continue;
+
+        // Update streak and gate entry on N consecutive matching ticks.
+        let entry_gate = {
+            let mut eng = engine.lock().await;
+            match signal_result {
+                Some((dir, sc)) => {
+                    eng.state.signal_score.store((sc * 1_000_000.0) as i64, Ordering::Release);
+                    let (new_streak, fire) = update_streak(
+                        eng.signal_streak, Some(dir), eng.config.signal_confirm_ticks,
+                    );
+                    eng.signal_streak = new_streak;
+                    if fire { Some((dir, sc)) } else { None }
+                }
+                None => {
+                    eng.state.signal_score.store(0, Ordering::Release);
+                    eng.signal_streak = (None, 0);
+                    None
+                }
             }
         };
-        engine.lock().await.state.signal_score.store(
-            (score * 1_000_000.0) as i64,
-            Ordering::Release,
-        );
+
+        let (direction, score) = match entry_gate {
+            Some(pair) => pair,
+            None => continue,
+        };
 
         // ── size + token id ────────────────────────────────────────────────
         let (size, dry_run, ttl_secs, state_arc, token_price_snap) = {
