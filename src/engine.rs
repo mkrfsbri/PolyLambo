@@ -245,6 +245,7 @@ pub fn update_streak(
 pub async fn run_engine_loop(
     engine: Arc<Mutex<TradingEngine>>,
     clob: Arc<crate::clob::ClobClient>,
+    db: Arc<crate::db::Db>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(LOOP_INTERVAL_MS));
     loop {
@@ -397,11 +398,9 @@ pub async fn run_engine_loop(
                     .unwrap_or(0),
             );
             state_arc.orders.insert(fake_id.clone(), crate::state::ActiveOrder {
-                order_id: fake_id.clone(),
-                side: match direction {
-                    Direction::Up   => OrderSide::Up,
-                    Direction::Down => OrderSide::Down,
-                },
+                order_id:  fake_id.clone(),
+                side:      match direction { Direction::Up => crate::state::OrderSide::Up,
+                                             Direction::Down => crate::state::OrderSide::Down },
                 price:     token_price_snap,
                 size_usdc: size,
                 placed_at: Instant::now(),
@@ -409,83 +408,74 @@ pub async fn run_engine_loop(
             });
             state_arc.bot_status.store(bot_status::POSITION, Ordering::Release);
 
-            // Deduct entry cost from simulated balance at fill time.
+            // Deduct entry cost from simulated balance.
             let bal = atomic_to_f64(state_arc.balance_usdc.load(Ordering::Acquire));
             state_arc.balance_usdc.store(
                 crate::state::f64_to_atomic((bal - size).max(0.0)),
                 Ordering::Release,
             );
 
+            let qty_shares_entry = if token_price_snap > 0.0 { size / token_price_snap } else { 0.0 };
+            let ptb_at_fill = atomic_to_f64(state_arc.eth_open_price.load(Ordering::Acquire));
+            let initial_slug = state_arc.current_slug.read().await.clone();
+
+            let btc_vel_snap = engine.lock().await.momentum.velocity();
+            let ptb_pct_snap = if ptb > 0.0 && eth_live > 0.0 {
+                (eth_live - ptb) / ptb * 100.0
+            } else { 0.0 };
+            let eth_price_snap = if eth_live > 0.0 { eth_live }
+                else { atomic_to_f64(state_arc.eth_spot_raw.load(Ordering::Acquire)) };
+            let slug_snap = initial_slug.clone();
+            let confirm_ticks_snap = engine.lock().await.config.signal_confirm_ticks;
+
+            // Persist trade open to DB
+            let trade_id = match db.insert_trade(&crate::db::TradeEntry {
+                opened_at:     chrono::Utc::now().to_rfc3339(),
+                slug:          slug_snap,
+                side:          match direction { Direction::Up => "Up".to_string(), Direction::Down => "Down".to_string() },
+                entry_price:   token_price_snap,
+                size_usdc:     size,
+                qty_shares:    qty_shares_entry,
+                score,
+                btc_vel:       btc_vel_snap,
+                ptb_pct:       ptb_pct_snap,
+                btc_price:     btc_price,
+                eth_price:     eth_price_snap,
+                confirm_ticks: confirm_ticks_snap,
+            }).await {
+                Ok(id) => id,
+                Err(e) => { tracing::warn!("[DB] insert_trade failed: {e:#}"); -1 }
+            };
+
             tracing::info!(
-                "[ENGINE] DRY_RUN signal={:?} score={score:.3} size=${size:.2} expiry={expiry}s",
+                "[ENGINE] DRY_RUN signal={:?} score={score:.3} size=${size:.2} \
+                 expiry={expiry}s trade_id={trade_id}",
                 direction
             );
-            let qty_shares_entry = if token_price_snap > 0.0 { size / token_price_snap } else { 0.0 };
-            record_trade(&state_arc, crate::state::TradeRecord {
-                closed_at:   Utc::now(),
-                side:        match direction {
-                    Direction::Up   => crate::state::OrderSide::Up,
-                    Direction::Down => crate::state::OrderSide::Down,
-                },
-                entry_price: token_price_snap,
-                qty_shares:  qty_shares_entry,
-                status:      crate::state::TradeStatus::Filled,
-            });
+
+            let (tp_pct, sl_pct) = {
+                let eng = engine.lock().await;
+                (eng.config.take_profit_pct, eng.config.stop_loss_pct)
+            };
 
             let decaying = { engine.lock().await.momentum.is_decaying() };
             state_arc.momentum_decaying.store(decaying as u8, Ordering::Release);
 
-            // Capture PTB at fill time — after slug rotation it would belong to the new window.
-            let ptb_at_fill  = atomic_to_f64(state_arc.eth_open_price.load(Ordering::Acquire));
-            let initial_slug = state_arc.current_slug.read().await.clone();
-            let state_w      = state_arc.clone();
+            let state_w = state_arc.clone();
+            let clob_w  = clob.clone();
+            let db_w    = db.clone();
+            let token_id_w = match direction {
+                Direction::Up   => state_arc.up_token_id.read().await.clone(),
+                Direction::Down => state_arc.down_token_id.read().await.clone(),
+            };
 
-            // Watchdog: hold the position until the market window rotates (= resolution).
             tokio::spawn(async move {
-                // Loop until slug changes; snapshot ETH price on the last tick.
-                let eth_at_close = loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let poly = atomic_to_f64(state_w.eth_poly_spot.load(Ordering::Acquire));
-                    let eth = if poly > 0.0 {
-                        poly
-                    } else {
-                        atomic_to_f64(state_w.eth_spot_raw.load(Ordering::Acquire))
-                    };
-                    let slug = state_w.current_slug.read().await.clone();
-                    if !slug.is_empty() && slug != initial_slug {
-                        break eth;
-                    }
-                };
-
-                // Determine simulated outcome: did ETH beat the price-to-beat?
-                let won = ptb_at_fill > 0.0 && eth_at_close > 0.0 && match direction {
-                    Direction::Up   => eth_at_close > ptb_at_fill,
-                    Direction::Down => eth_at_close < ptb_at_fill,
-                };
-                // Each token pays $1 if won, $0 if lost; qty = size / entry_price.
-                let proceeds = if won && token_price_snap > 0.0 {
-                    size / token_price_snap
-                } else {
-                    0.0
-                };
-                let pnl = proceeds - size;
-
-                // Return proceeds to balance (cost was already deducted at fill).
-                let bal = atomic_to_f64(state_w.balance_usdc.load(Ordering::Acquire));
-                state_w.balance_usdc.store(
-                    crate::state::f64_to_atomic(bal + proceeds),
-                    Ordering::Release,
-                );
-                // Accumulate running P&L (stored as cents).
-                state_w.pnl_usdc.fetch_add((pnl * 100.0) as i64, Ordering::AcqRel);
-
-                tracing::info!(
-                    "[ENGINE] DRY_RUN resolved | dir={direction:?} won={won} \
-                     eth=${eth_at_close:.2} ptb=${ptb_at_fill:.2} pnl=${pnl:.2}"
-                );
-
-                state_w.orders.remove(&fake_id);
-                state_w.bot_status.store(bot_status::HUNTING, Ordering::Release);
+                position_watchdog(
+                    fake_id, token_id_w, direction, token_price_snap,
+                    size, qty_shares_entry, initial_slug, ptb_at_fill,
+                    tp_pct, sl_pct, trade_id, true,
+                    state_w, clob_w, db_w,
+                ).await;
             });
             continue;
         }
@@ -539,12 +529,51 @@ pub async fn run_engine_loop(
             direction, lat_us
         );
 
-        // ── watchdog ───────────────────────────────────────────────────────
-        let initial_trend   = state_arc.btc.trend.load(Ordering::Acquire);
+        // ── position watchdog ─────────────────────────────────────────────
+        let qty_shares_live = if price > 0.0 { size / price } else { 0.0 };
+        let ptb_at_fill_live = atomic_to_f64(state_arc.eth_open_price.load(Ordering::Acquire));
+        let initial_slug_live = state_arc.current_slug.read().await.clone();
+        let btc_vel_snap = engine.lock().await.momentum.velocity();
+        let ptb_pct_snap = if ptb > 0.0 && eth_live > 0.0 {
+            (eth_live - ptb) / ptb * 100.0
+        } else { 0.0 };
+        let eth_price_snap = if eth_live > 0.0 { eth_live }
+            else { atomic_to_f64(state_arc.eth_spot_raw.load(Ordering::Acquire)) };
+        let confirm_ticks_snap = engine.lock().await.config.signal_confirm_ticks;
+
+        let trade_id_live = match db.insert_trade(&crate::db::TradeEntry {
+            opened_at:     chrono::Utc::now().to_rfc3339(),
+            slug:          initial_slug_live.clone(),
+            side:          match direction { Direction::Up => "Up".to_string(), Direction::Down => "Down".to_string() },
+            entry_price:   price,
+            size_usdc:     size,
+            qty_shares:    qty_shares_live,
+            score,
+            btc_vel:       btc_vel_snap,
+            ptb_pct:       ptb_pct_snap,
+            btc_price:     btc_price,
+            eth_price:     eth_price_snap,
+            confirm_ticks: confirm_ticks_snap,
+        }).await {
+            Ok(id) => id,
+            Err(e) => { tracing::warn!("[DB] insert_trade failed: {e:#}"); -1 }
+        };
+
+        let (tp_pct, sl_pct) = {
+            let eng = engine.lock().await;
+            (eng.config.take_profit_pct, eng.config.stop_loss_pct)
+        };
+
         let state_for_watch = state_arc.clone();
-        let clob_w          = clob.clone();
+        let clob_w = clob.clone();
+        let db_w = db.clone();
         tokio::spawn(async move {
-            order_watchdog(order_id, ttl_secs, initial_trend, state_for_watch, clob_w).await;
+            position_watchdog(
+                order_id, token_id, direction, price,
+                size, qty_shares_live, initial_slug_live, ptb_at_fill_live,
+                tp_pct, sl_pct, trade_id_live, false,
+                state_for_watch, clob_w, db_w,
+            ).await;
         });
 
         // Update momentum_decaying for TUI
@@ -559,54 +588,118 @@ fn record_trade(state: &AppState, record: crate::state::TradeRecord) {
     h.truncate(50);
 }
 
-/// Cancel an order after TTL expires OR BTC trend flips — whichever comes first.
-async fn order_watchdog(
+#[allow(clippy::too_many_arguments)]
+async fn position_watchdog(
     order_id: String,
-    ttl_secs: u64,
-    initial_trend: u8,
-    state: Arc<AppState>,
+    token_id: String,
+    direction: Direction,
+    entry_price: f64,
+    size_usdc: f64,
+    qty_shares: f64,
+    initial_slug: String,
+    ptb_at_fill: f64,
+    take_profit_pct: f64,
+    stop_loss_pct: f64,
+    trade_id: i64,
+    dry_run: bool,
+    state: Arc<crate::state::AppState>,
     clob: Arc<crate::clob::ClobClient>,
+    db: Arc<crate::db::Db>,
 ) {
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs(ttl_secs)) => {
-            tracing::info!("[ENGINE] TTL expired — cancelling {order_id}");
-            let _ = clob.cancel_order(&order_id).await;
-            if let Some((_, order)) = state.orders.remove(&order_id) {
-                let shares = if order.price > 0.0 { order.size_usdc / order.price } else { 0.0 };
-                record_trade(&state, crate::state::TradeRecord {
-                    closed_at:   Utc::now(),
-                    side:        order.side,
-                    entry_price: order.price,
-                    qty_shares:  shares,
-                    status:      crate::state::TradeStatus::Cancelled,
-                });
-            }
-        }
-        _ = wait_trend_change(&state, initial_trend) => {
-            tracing::info!("[ENGINE] Trend flipped — cancelling {order_id}");
-            let _ = clob.cancel_order(&order_id).await;
-            if let Some((_, order)) = state.orders.remove(&order_id) {
-                let shares = if order.price > 0.0 { order.size_usdc / order.price } else { 0.0 };
-                record_trade(&state, crate::state::TradeRecord {
-                    closed_at:   Utc::now(),
-                    side:        order.side,
-                    entry_price: order.price,
-                    qty_shares:  shares,
-                    status:      crate::state::TradeStatus::Cancelled,
-                });
-            }
-        }
-    }
-    state.bot_status.store(bot_status::HUNTING, Ordering::Release);
-}
+    use crate::state::{atomic_to_f64, bot_status, f64_to_atomic};
 
-async fn wait_trend_change(state: &AppState, initial_trend: u8) {
-    loop {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if state.btc.trend.load(Ordering::Acquire) != initial_trend {
-            break;
+    let exit_reason: &'static str = loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Priority 1: emergency
+        if state.bot_status.load(Ordering::Acquire) == bot_status::EMERGENCY {
+            break "Emergency";
+        }
+
+        // Priority 2: slug rotation → market resolved
+        {
+            let slug = state.current_slug.read().await;
+            if !slug.is_empty() && *slug != initial_slug {
+                break "Resolved";
+            }
+        }
+
+        // Priority 3: TP / SL on token mid-price
+        let current_price = atomic_to_f64(match direction {
+            Direction::Up   => state.eth_up_price.load(Ordering::Acquire),
+            Direction::Down => state.eth_down_price.load(Ordering::Acquire),
+        });
+        if current_price > 0.0 {
+            let pnl_pct = (current_price - entry_price) / entry_price * 100.0;
+            if pnl_pct >= take_profit_pct { break "TakeProfit"; }
+            if pnl_pct <= -stop_loss_pct  { break "StopLoss"; }
+        }
+    };
+
+    let exit_price = atomic_to_f64(match direction {
+        Direction::Up   => state.eth_up_price.load(Ordering::Acquire),
+        Direction::Down => state.eth_down_price.load(Ordering::Acquire),
+    });
+
+    // Calculate proceeds
+    let proceeds = if exit_reason == "Resolved" {
+        let eth_now = {
+            let poly = atomic_to_f64(state.eth_poly_spot.load(Ordering::Acquire));
+            if poly > 0.0 { poly }
+            else { atomic_to_f64(state.eth_spot_raw.load(Ordering::Acquire)) }
+        };
+        let won = ptb_at_fill > 0.0 && eth_now > 0.0 && match direction {
+            Direction::Up   => eth_now > ptb_at_fill,
+            Direction::Down => eth_now < ptb_at_fill,
+        };
+        if won { qty_shares * 1.0 } else { 0.0 }
+    } else {
+        qty_shares * exit_price
+    };
+
+    let pnl = proceeds - size_usdc;
+
+    // Update shared state
+    if dry_run {
+        let bal = atomic_to_f64(state.balance_usdc.load(Ordering::Acquire));
+        state.balance_usdc.store(f64_to_atomic((bal + proceeds).max(0.0)), Ordering::Release);
+    }
+    state.pnl_usdc.fetch_add((pnl * 100.0) as i64, Ordering::AcqRel);
+    state.orders.remove(&order_id);
+    state.bot_status.store(bot_status::HUNTING, Ordering::Release);
+
+    record_trade(&state, crate::state::TradeRecord {
+        closed_at:   Utc::now(),
+        side:        match direction {
+            Direction::Up   => crate::state::OrderSide::Up,
+            Direction::Down => crate::state::OrderSide::Down,
+        },
+        entry_price,
+        qty_shares,
+        status: if exit_reason == "StopLoss" || exit_reason == "Emergency" {
+            crate::state::TradeStatus::Cancelled
+        } else {
+            crate::state::TradeStatus::Filled
+        },
+    });
+
+    // Persist close to DB (non-blocking: log on failure, never panic)
+    if let Err(e) = db.close_trade(trade_id, exit_price, pnl, exit_reason).await {
+        tracing::warn!("[DB] close_trade failed: {e:#}");
+    }
+
+    // Live: cancel pending orders and sell if TP/SL/Emergency
+    if !dry_run && exit_reason != "Resolved" {
+        let _ = clob.cancel_all().await;
+        if qty_shares > 0.0 {
+            let _ = clob.sell_best_bid(&token_id, qty_shares).await;
         }
     }
+
+    tracing::info!(
+        "[ENGINE] Position closed | dir={direction:?} reason={exit_reason} \
+         entry={entry_price:.4} exit={exit_price:.4} pnl=${pnl:.2}"
+    );
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
