@@ -288,41 +288,52 @@ fn render_position(frame: &mut Frame, area: Rect, pos: Option<&PositionSnap>) {
 }
 
 fn render_history(frame: &mut Frame, area: Rect, history: &[TradeSnap]) {
-    let header = Row::new(["Time", "Side", "Price", "Qty(shr)", "Status"])
+    let header = Row::new(["Time", "Side", "Entry", "Exit", "PnL", "Reason"])
         .style(Style::default().bold().fg(Color::Yellow));
 
     let rows: Vec<Row> = if history.is_empty() {
         vec![
-            Row::new(["No completed trades yet", "", "", "", ""])
+            Row::new(["No completed trades yet", "", "", "", "", ""])
                 .style(Style::default().fg(Color::DarkGray)),
         ]
     } else {
         history
             .iter()
             .map(|t| {
-                let color = if t.status == "Filled" {
-                    Color::Green
-                } else {
-                    Color::DarkGray
+                let reason_abbr = match t.exit_reason.as_str() {
+                    "TakeProfit" => "TP",
+                    "StopLoss"   => "SL",
+                    "Resolved"   => "RES",
+                    "Emergency"  => "EMG",
+                    _            => "?",
                 };
-                Row::new([
-                    t.time.clone(),
-                    t.side.clone(),
-                    format!("{:.4}", t.price),
-                    format!("{:.2}", t.qty),
-                    t.status.clone(),
+                let pnl_sign = if t.pnl_usdc >= 0.0 { "+" } else { "" };
+                let pnl_str  = format!("{pnl_sign}{:.2}", t.pnl_usdc);
+                let pnl_color = if t.pnl_usdc >= 0.0 { Color::Green } else { Color::Red };
+                let row_color = match t.exit_reason.as_str() {
+                    "TakeProfit" | "Resolved" => Color::Green,
+                    "StopLoss" | "Emergency"  => Color::Red,
+                    _                         => Color::DarkGray,
+                };
+                Row::new(vec![
+                    ratatui::text::Span::styled(t.time.clone(),              Style::default().fg(row_color)),
+                    ratatui::text::Span::styled(t.side.clone(),              Style::default().fg(row_color)),
+                    ratatui::text::Span::styled(format!("{:.4}", t.entry_price), Style::default().fg(row_color)),
+                    ratatui::text::Span::styled(format!("{:.4}", t.exit_price),  Style::default().fg(row_color)),
+                    ratatui::text::Span::styled(pnl_str,                     Style::default().fg(pnl_color).bold()),
+                    ratatui::text::Span::styled(reason_abbr.to_string(),     Style::default().fg(row_color)),
                 ])
-                .style(Style::default().fg(color))
             })
             .collect()
     };
 
     let widths = [
-        Constraint::Length(10),
-        Constraint::Length(5),
+        Constraint::Length(9),
+        Constraint::Length(4),
         Constraint::Length(7),
-        Constraint::Length(8),
-        Constraint::Length(10),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(4),
     ];
 
     let table = Table::new(rows, widths)

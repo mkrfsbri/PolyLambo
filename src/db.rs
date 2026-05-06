@@ -1,5 +1,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
+use sqlx::sqlite::SqliteConnectOptions;
+use std::str::FromStr;
 
 pub struct Db {
     pool: SqlitePool,
@@ -22,9 +24,16 @@ pub struct TradeEntry {
 
 impl Db {
     pub async fn open(url: &str) -> Result<Self> {
+        // Accept bare paths (./trades.db) or full sqlite: URLs (sqlite::memory:)
+        let sqlite_url = if url.starts_with("sqlite:") {
+            url.to_string()
+        } else {
+            format!("sqlite:{url}")
+        };
+        let opts = SqliteConnectOptions::from_str(&sqlite_url)?.create_if_missing(true);
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
-            .connect(url)
+            .connect_with(opts)
             .await?;
         sqlx::query(include_str!("../migrations/001_trades.sql"))
             .execute(&pool)

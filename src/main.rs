@@ -266,7 +266,7 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
         },
         score_threshold,
         history: {
-            use state::{OrderSide, TradeStatus};
+            use state::OrderSide;
             let h = state.trade_history.lock().unwrap();
             h.iter().take(5).map(|r| tui::TradeSnap {
                 time: r.closed_at.format("%H:%M:%S").to_string(),
@@ -274,12 +274,10 @@ async fn build_snapshot(state: &state::AppState, score_threshold: f64) -> tui::T
                     OrderSide::Up   => "UP".to_string(),
                     OrderSide::Down => "DN".to_string(),
                 },
-                price:  r.entry_price,
-                qty:    r.qty_shares,
-                status: match r.status {
-                    TradeStatus::Filled    => "Filled".to_string(),
-                    TradeStatus::Cancelled => "Cancelled".to_string(),
-                },
+                entry_price: r.entry_price,
+                exit_price:  r.exit_price,
+                pnl_usdc:    r.pnl_usdc,
+                exit_reason: r.exit_reason.clone(),
             }).collect()
         },
         active_position: if state.bot_status.load(Ordering::Acquire) == state::bot_status::POSITION {

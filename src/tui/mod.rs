@@ -85,11 +85,13 @@ pub struct OrderSnap {
 
 #[derive(Clone, Default)]
 pub struct TradeSnap {
-    pub time:   String,   // "HH:MM:SS"
-    pub side:   String,   // "UP" | "DN"
-    pub price:  f64,
-    pub qty:    f64,      // shares (tokens held)
-    pub status: String,   // "Filled" | "Cancelled"
+    pub time:        String,   // "HH:MM:SS"
+    pub side:        String,   // "UP" | "DN"
+    pub entry_price: f64,
+    pub exit_price:  f64,
+    pub pnl_usdc:    f64,
+    /// "TakeProfit" | "StopLoss" | "Resolved" | "Emergency"
+    pub exit_reason: String,
 }
 
 #[derive(Clone, Default)]

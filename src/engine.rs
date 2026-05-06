@@ -675,12 +675,15 @@ async fn position_watchdog(
             Direction::Down => crate::state::OrderSide::Down,
         },
         entry_price,
+        exit_price,
         qty_shares,
+        pnl_usdc:    pnl,
         status: if exit_reason == "StopLoss" || exit_reason == "Emergency" {
             crate::state::TradeStatus::Cancelled
         } else {
             crate::state::TradeStatus::Filled
         },
+        exit_reason: exit_reason.to_string(),
     });
 
     // Persist close to DB (non-blocking: log on failure, never panic)

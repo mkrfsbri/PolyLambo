@@ -97,9 +97,13 @@ pub struct TradeRecord {
     pub closed_at:   chrono::DateTime<chrono::Utc>,
     pub side:        OrderSide,
     pub entry_price: f64,
+    pub exit_price:  f64,
     /// Shares (tokens) held — size_usdc / entry_price
     pub qty_shares:  f64,
+    pub pnl_usdc:    f64,
     pub status:      TradeStatus,
+    /// "TakeProfit" | "StopLoss" | "Resolved" | "Emergency"
+    pub exit_reason: String,
 }
 
 // ── bot status constants ─────────────────────────────────────────────────────
@@ -293,8 +297,11 @@ mod tests {
                 closed_at: chrono::Utc::now(),
                 side: OrderSide::Up,
                 entry_price: 0.52,
+                exit_price: 0.56,
                 qty_shares: 10.0 / 0.52,
+                pnl_usdc: 0.77,
                 status: TradeStatus::Filled,
+                exit_reason: "TakeProfit".to_string(),
             });
             h.truncate(50);
         }
@@ -311,15 +318,21 @@ mod tests {
                 closed_at: chrono::Utc::now(),
                 side: OrderSide::Up,
                 entry_price: 0.50,
+                exit_price: 0.475,
                 qty_shares: 5.0 / 0.50,
+                pnl_usdc: -0.25,
                 status: TradeStatus::Cancelled,
+                exit_reason: "StopLoss".to_string(),
             });
             h.push_front(TradeRecord {
                 closed_at: chrono::Utc::now(),
                 side: OrderSide::Down,
                 entry_price: 0.48,
+                exit_price: 0.52,
                 qty_shares: 8.0 / 0.48,
+                pnl_usdc: 0.67,
                 status: TradeStatus::Filled,
+                exit_reason: "TakeProfit".to_string(),
             });
         }
         let h = state.trade_history.lock().unwrap();
