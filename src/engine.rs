@@ -128,6 +128,7 @@ pub struct TradingEngine {
     pub config: Arc<Config>,
     pub momentum: MomentumWindow,
     pub entry: Option<EntryContext>,
+    pub signal_streak: (Option<Direction>, u8),
 }
 
 impl TradingEngine {
@@ -138,6 +139,7 @@ impl TradingEngine {
             config,
             momentum: MomentumWindow::new(window),
             entry: None,
+            signal_streak: (None, 0),
         }
     }
 
@@ -214,6 +216,27 @@ impl TradingEngine {
     pub fn half_kelly_size(&self, edge: f64, balance: f64) -> f64 {
         let fraction = (2.0 * edge) * self.config.kelly_fraction;
         fraction.clamp(0.0, 0.1) * balance
+    }
+}
+
+/// Returns (new_streak_state, should_enter).
+/// Fires when the same direction holds for `confirm_ticks` consecutive ticks.
+/// Resets to (None, 0) after firing or on no-signal / direction flip.
+pub fn update_streak(
+    streak: (Option<Direction>, u8),
+    signal: Option<Direction>,
+    confirm_ticks: u8,
+) -> ((Option<Direction>, u8), bool) {
+    match signal {
+        None => ((None, 0), false),
+        Some(dir) => {
+            let count = if streak.0 == Some(dir) { streak.1 + 1 } else { 1 };
+            if count >= confirm_ticks {
+                ((None, 0), true)
+            } else {
+                ((Some(dir), count), false)
+            }
+        }
     }
 }
 
@@ -815,5 +838,49 @@ mod tests {
         eng.compute_signal(3000, 104.5, 0.0, 0.0);
         let sig = eng.compute_signal(4000, 105.0, 0.0, 0.0);
         assert!(sig.is_none(), "signal should be suppressed near expiry with decaying momentum");
+    }
+
+    // ── update_streak ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_streak_builds_and_fires() {
+        let mut s = (None::<Direction>, 0u8);
+
+        let (ns, fire) = update_streak(s, Some(Direction::Up), 3);
+        assert!(!fire); assert_eq!(ns, (Some(Direction::Up), 1)); s = ns;
+
+        let (ns, fire) = update_streak(s, Some(Direction::Up), 3);
+        assert!(!fire); assert_eq!(ns, (Some(Direction::Up), 2)); s = ns;
+
+        let (ns, fire) = update_streak(s, Some(Direction::Up), 3);
+        assert!(fire); assert_eq!(ns, (None, 0)); s = ns;
+
+        // After reset, needs a fresh run
+        let (ns, fire) = update_streak(s, Some(Direction::Up), 3);
+        assert!(!fire); assert_eq!(ns, (Some(Direction::Up), 1));
+    }
+
+    #[test]
+    fn test_streak_resets_on_direction_flip() {
+        let s = (Some(Direction::Up), 2u8);
+        let (ns, fire) = update_streak(s, Some(Direction::Down), 3);
+        assert!(!fire);
+        assert_eq!(ns, (Some(Direction::Down), 1));
+    }
+
+    #[test]
+    fn test_streak_resets_on_no_signal() {
+        let s = (Some(Direction::Up), 2u8);
+        let (ns, fire) = update_streak(s, None, 3);
+        assert!(!fire);
+        assert_eq!(ns, (None, 0));
+    }
+
+    #[test]
+    fn test_streak_fires_at_threshold_one() {
+        let s = (None, 0u8);
+        let (ns, fire) = update_streak(s, Some(Direction::Down), 1);
+        assert!(fire);
+        assert_eq!(ns, (None, 0));
     }
 }
