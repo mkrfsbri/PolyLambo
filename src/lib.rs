@@ -1,4 +1,5 @@
 pub mod binance;
+pub mod db;
 pub mod clob;
 pub mod config;
 pub mod engine;
